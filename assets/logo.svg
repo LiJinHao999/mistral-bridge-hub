@@ -1,0 +1,22 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="128" height="128" viewBox="0 0 128 128">
+  <defs>
+    <linearGradient id="grad" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" style="stop-color:#4f46e5"/>
+      <stop offset="100%" style="stop-color:#f97316"/>
+    </linearGradient>
+  </defs>
+  <!-- rounded square bg -->
+  <rect x="4" y="4" width="120" height="120" rx="24" fill="url(#grad)"/>
+  <!-- bridge arch -->
+  <path d="M 24 84 Q 64 28 104 84" fill="none" stroke="white" stroke-width="8" stroke-linecap="round"/>
+  <!-- left pillar -->
+  <rect x="16" y="88" width="10" height="24" rx="3" fill="white"/>
+  <!-- right pillar -->
+  <rect x="102" y="88" width="10" height="24" rx="3" fill="white"/>
+  <!-- data dots on bridge -->
+  <circle cx="44" cy="59" r="5" fill="#fde047"/>
+  <circle cx="64" cy="49" r="5" fill="#fde047"/>
+  <circle cx="84" cy="59" r="5" fill="#fde047"/>
+  <!-- spark -->
+  <path d="M 84 30 l 4 10 l 10 4 l -10 4 l -4 10 l -4 -10 l -10 -4 l 10 -4 z" fill="#fde047"/>
+</svg>
