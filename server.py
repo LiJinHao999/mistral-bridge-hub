@@ -25,7 +25,7 @@ from fastapi import FastAPI, Request, Response
 from fastapi.responses import StreamingResponse
 
 # ── Konfigurasi ──────────────────────────────────────────────────────────────
-MISTRAL_KEY  = os.environ.get("MISTRAL_KEY", "")  # fallback — client key优先
+MISTRAL_KEY  = os.environ.get("MISTRAL_KEY", "")  # fallback — client key takes precedence
 MODEL        = os.environ.get("BRIDGE_MODEL", "glm-5-2")
 PORT         = int(os.environ.get("BRIDGE_PORT", 8090))
 HOST         = os.environ.get("BRIDGE_HOST", "0.0.0.0")
@@ -53,7 +53,7 @@ def normalize_messages(messages: list) -> list:
 
 def resolve_reasoning(body: dict):
     """Client options -> Mistral reasoning_effort ('none'/'high'). Default: thinking ON.
-    Upstream hanya menerima 'none'/'high' — semua nilai effort lain dipetakan ke 'high'."""
+    Upstream only accepts 'none'/'high' — all other effort values are mapped to 'high'."""
     if body.get("reasoning_effort"):
         effort = str(body["reasoning_effort"]).lower()
         if effort in ("none", "off", "disabled"):
@@ -144,7 +144,7 @@ def mistral_to_openai(data: dict, model: str) -> dict:
 
 
 async def stream_response(upstream_key: str, model: str, payload: dict):
-    """Proksi SSE: upstream Mistral conversations stream -> OpenAI chat.completion.chunk."""
+    """SSE proxy: upstream Mistral conversations stream -> OpenAI chat.completion.chunk."""
     async with aiohttp.ClientSession() as session:
         try:
             async with session.post(
@@ -234,7 +234,7 @@ async def chat(request: Request):
     except Exception as e:
         return error_response(422, f"Payload translation error: {e}", "invalid_payload")
 
-    # 网关模式：优先透传客户端 Authorization，否则用环境变量 MISTRAL_KEY
+    # Gateway mode: pass through client Authorization, fall back to server MISTRAL_KEY
     auth_header = request.headers.get("Authorization", "")
     key = auth_header[7:].strip() if auth_header.startswith("Bearer ") else ""
     upstream_key = key or MISTRAL_KEY
