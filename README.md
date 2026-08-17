@@ -93,6 +93,11 @@ curl http://127.0.0.1:20128/v1/chat/completions \
   -H "Authorization: Bearer <9router-key>" \
   -H "Content-Type: application/json" \
   -d '{"model":"openai-compatible-chat-xxxx/glm-5-2","messages":[{"role":"user","content":"halo"}],"max_tokens":50}'
+
+# Responses API (conversation_id is returned as response.id)
+curl http://127.0.0.1:8090/v1/responses \
+  -H "Content-Type: application/json" \
+  -d '{"model":"glm-5-2","input":"halo","max_output_tokens":50}'
 ```
 
 ## 📦 Environment Variables
