@@ -19,6 +19,9 @@ Thumbs.db
 .vscode/
 .idea/
 
+# Serena MCP
+.serena/
+
 # Git
 *.orig
 *.rej

@@ -41,7 +41,11 @@ APPEND_CONFLICT_RETRIES = 4
 APPEND_CONFLICT_BACKOFF = 0.4
 
 _conv_cache: dict[str, tuple[str, int, list]] = {}
+_conv_prompt_tokens: dict[str, int] = {}
 _CONV_CACHE_LIMIT = 64
+# Mistral prompt-cache blocks are 64 tokens. Conversations usage omits
+# cached_tokens, so we floor the local estimate to this size.
+CACHE_BLOCK_TOKENS = 64
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger("mistral-bridge")
@@ -550,6 +554,10 @@ def prepare_append_entries(entries: list) -> list:
     A conversation waiting on function.calls rejects anything except
     function.result. Client replays often mix those results with the
     previous assistant text / the function.call items themselves.
+
+    If the slice also contains a later user turn, this cache prefix is
+    stale (several turns behind). Return [] so find_append_match skips it
+    instead of sending orphan results for tool_call_ids this conv never saw.
     """
     if not entries:
         return entries
@@ -558,6 +566,12 @@ def prepare_append_entries(entries: list) -> list:
         if isinstance(item, dict) and item.get("type") == "function.result"
     ]
     if results:
+        if any(isinstance(item, dict) and item.get("role") == "user" for item in entries):
+            log.info(
+                "append skip stale prefix results=%d kinds=%s",
+                len(results), input_kinds(entries),
+            )
+            return []
         dropped = len(entries) - len(results)
         if dropped:
             log.info(
@@ -620,12 +634,14 @@ def function_call_entries_from_tool_state(tool_state: dict) -> list:
     return calls
 
 
-def cache_conversation(conv_id: str, entries: list, extra_entries: list = None):
+def cache_conversation(conv_id: str, entries: list, extra_entries: list = None, prompt_tokens: int = 0):
     """Remember the client request now stored on this conversation.
 
     extra_entries is ignored: reconstructed model function.calls rarely hash
     equal to the client's replay, and prepare_append_entries already
     strips those calls from the next append.
+    prompt_tokens is the last successful prompt size, used to infer
+    cached_tokens on the next append when Mistral omits cache fields.
     """
     if not conv_id or conv_id.startswith("resp_"):
         return
@@ -635,8 +651,13 @@ def cache_conversation(conv_id: str, entries: list, extra_entries: list = None):
     evict_conversation(conv_id)
     prefix_hash = _entries_hash(stored)
     _conv_cache[prefix_hash] = (conv_id, len(stored), stored)
+    if prompt_tokens:
+        _conv_prompt_tokens[conv_id] = int(prompt_tokens)
     while len(_conv_cache) > _CONV_CACHE_LIMIT:
-        _conv_cache.pop(next(iter(_conv_cache)))
+        evicted = _conv_cache.pop(next(iter(_conv_cache)))
+        evicted_id = evicted[0] if evicted else ""
+        if evicted_id and all(item[0] != evicted_id for item in _conv_cache.values()):
+            _conv_prompt_tokens.pop(evicted_id, None)
 
 
 def evict_conversation(conv_id: str):
@@ -645,6 +666,7 @@ def evict_conversation(conv_id: str):
     stale_keys = [key for key, (cached_id, _, _) in _conv_cache.items() if cached_id == conv_id]
     for key in stale_keys:
         _conv_cache.pop(key, None)
+    _conv_prompt_tokens.pop(conv_id, None)
 
 
 def strip_for_append(payload: dict) -> dict:
@@ -697,6 +719,13 @@ def append_state_mismatch(status: int, text: str) -> bool:
     return (
         "function results are still missing" in lowered
         or "cannot append other inputs" in lowered
+        # Local prefix is stale: those tool_call_ids were already consumed
+        # or never existed on this conversation. Evict and create, or the
+        # client retries the same append forever.
+        or "already have a result" in lowered
+        or "already has a result" in lowered
+        or "unknown tool_call_ids" in lowered
+        or "unknown tool_call_id" in lowered
     )
 
 
@@ -946,18 +975,46 @@ def usage_from_event(data) -> dict:
     """Pull a raw Mistral usage object off a stream/non-stream payload."""
     if not isinstance(data, dict):
         return {}
-    usage = data.get("usage")
-    if isinstance(usage, dict) and usage:
-        return usage
-    resp = data.get("response")
-    if isinstance(resp, dict):
-        usage = resp.get("usage")
+    for key in ("usage", "token_usage", "usage_info"):
+        usage = data.get(key)
         if isinstance(usage, dict) and usage:
             return usage
+    resp = data.get("response")
+    if isinstance(resp, dict):
+        for key in ("usage", "token_usage", "usage_info"):
+            usage = resp.get(key)
+            if isinstance(usage, dict) and usage:
+                return usage
     return {}
 
 
-def mistral_usage_fields(usage) -> dict:
+def merge_raw_usage(current: dict, incoming: dict) -> dict:
+    """Keep fields from earlier events; later non-empty values win."""
+    if not incoming:
+        return current or {}
+    merged = dict(current or {})
+    merged.update(incoming)
+    return merged
+
+
+def estimate_cached_tokens(prompt_tokens: int, previous_prompt_tokens: int) -> int:
+    """Estimate cache hits when Conversations omits prompt_tokens_details.
+
+    An append's prompt is previous_prompt + this turn. The previous prompt
+    is a conservative prefix. Official cache blocks are 64 tokens.
+    """
+    if prompt_tokens < CACHE_BLOCK_TOKENS or previous_prompt_tokens < CACHE_BLOCK_TOKENS:
+        return 0
+    return min(prompt_tokens, previous_prompt_tokens) // CACHE_BLOCK_TOKENS * CACHE_BLOCK_TOKENS
+
+
+def cache_log_label(fields: dict) -> str:
+    """`cache=N` when upstream reported it; `cache~N` when locally estimated."""
+    mark = "~" if fields.get("cache_estimated") else "="
+    return f"cache{mark}{fields.get('cached', 0)}"
+
+
+def mistral_usage_fields(usage, conv_id: str = None) -> dict:
     """Normalize Mistral usage aliases to a flat dict."""
     if not isinstance(usage, dict):
         usage = {}
@@ -976,9 +1033,13 @@ def mistral_usage_fields(usage) -> dict:
     cached = (
         in_details.get("cached_tokens")
         or in_details.get("cache_read_tokens")
+        or in_details.get("cached_prompt_tokens")
         or usage.get("cached_tokens")
         or usage.get("num_cached_tokens")
         or usage.get("cache_read_tokens")
+        or usage.get("cached_prompt_tokens")
+        or usage.get("cache_hit_tokens")
+        or usage.get("prefix_tokens")
         or 0
     )
     cache_write = (
@@ -999,19 +1060,26 @@ def mistral_usage_fields(usage) -> dict:
         or usage.get("thinking_tokens")
         or 0
     )
+    cached = _as_int(cached)
+    cache_estimated = False
+    if not cached and conv_id:
+        estimated = estimate_cached_tokens(prompt, _conv_prompt_tokens.get(conv_id, 0))
+        if estimated:
+            cached = estimated
+            cache_estimated = True
     return {
         "prompt": prompt,
         "completion": completion,
         "total": total,
-        "cached": _as_int(cached),
+        "cached": cached,
         "cache_write": _as_int(cache_write),
         "reasoning": _as_int(reasoning),
+        "cache_estimated": cache_estimated,
     }
 
 
-def responses_usage_from_mistral(usage) -> dict:
-    """Mistral usage -> OpenAI Responses usage (incl. cache / reasoning details)."""
-    fields = mistral_usage_fields(usage)
+def responses_usage_from_fields(fields: dict) -> dict:
+    """Flat usage fields -> OpenAI Responses usage."""
     details_in = {"cached_tokens": fields["cached"]}
     if fields["cache_write"]:
         details_in["cache_write_tokens"] = fields["cache_write"]
@@ -1024,9 +1092,8 @@ def responses_usage_from_mistral(usage) -> dict:
     }
 
 
-def chat_usage_from_mistral(usage) -> dict:
-    """Mistral usage -> OpenAI Chat Completions usage."""
-    fields = mistral_usage_fields(usage)
+def chat_usage_from_fields(fields: dict) -> dict:
+    """Flat usage fields -> OpenAI Chat Completions usage."""
     out = {
         "prompt_tokens": fields["prompt"],
         "completion_tokens": fields["completion"],
@@ -1040,6 +1107,16 @@ def chat_usage_from_mistral(usage) -> dict:
     if fields["reasoning"]:
         out["completion_tokens_details"] = {"reasoning_tokens": fields["reasoning"]}
     return out
+
+
+def responses_usage_from_mistral(usage, conv_id: str = None) -> dict:
+    """Mistral usage -> OpenAI Responses usage (incl. cache / reasoning details)."""
+    return responses_usage_from_fields(mistral_usage_fields(usage, conv_id))
+
+
+def chat_usage_from_mistral(usage, conv_id: str = None) -> dict:
+    """Mistral usage -> OpenAI Chat Completions usage."""
+    return chat_usage_from_fields(mistral_usage_fields(usage, conv_id))
 
 
 def _function_call_to_openai(entry: dict, index: int) -> dict:
@@ -1090,7 +1167,10 @@ def mistral_to_openai(data: dict, model: str) -> dict:
             "message": message,
             "finish_reason": "tool_calls" if tool_calls else "stop",
         }],
-        "usage": chat_usage_from_mistral(usage_from_event(data)),
+        "usage": chat_usage_from_mistral(
+            usage_from_event(data),
+            data.get("conversation_id"),
+        ),
     }
 
 
@@ -1134,7 +1214,7 @@ def mistral_to_responses(data: dict, model: str) -> dict:
             "status": "completed",
             "content": [{"type": "output_text", "text": text_acc}],
         })
-    usage = responses_usage_from_mistral(usage_from_event(data))
+    usage = responses_usage_from_mistral(usage_from_event(data), conv_id)
     return {
         "id": conv_id,
         "object": "response",
@@ -1442,12 +1522,13 @@ async def stream_response(upstream_key: str, model: str, payload: dict):
                 if not sent_role:
                     yield emit({"content": ""})
                 finish_reason = "tool_calls" if saw_tool_call else "stop"
-                usage = chat_usage_from_mistral(raw_usage)
+                fields = mistral_usage_fields(raw_usage, conv_id)
+                usage = chat_usage_from_fields(fields)
                 log.info(
                     "stream done conv=%s types=%s chunks=%d finish=%s tools=%s usage=%s think=%d raw_usage_keys=%s",
                     conv_id, seen_types, yielded, finish_reason, tool_names,
                     f"{usage['prompt_tokens']}+{usage['completion_tokens']}={usage['total_tokens']}"
-                    f" cache={(usage.get('prompt_tokens_details') or {}).get('cached_tokens', 0)}",
+                    f" {cache_log_label(fields)}",
                     len(think_acc),
                     sorted((raw_usage or {}).keys()),
                 )
@@ -1486,6 +1567,7 @@ async def stream_responses(upstream_key: str, model: str, payload: dict, conv_id
             tries = CREATE_CONNECT_RETRIES if reason == "create" else APPEND_CONFLICT_RETRIES
             for attempt in range(1, tries + 1):
                 opened = False
+                got_event = False
                 try:
                     async with session.post(
                         url,
@@ -1534,6 +1616,7 @@ async def stream_responses(upstream_key: str, model: str, payload: dict, conv_id
                         tool_state = {}
                         seen_types = []
                         raw_usage = {}
+                        got_event = False
                         # Never advertise a client-local id on a create fallback.
                         rid = conv_id if reason == "append" else ""
                         created_at = int(time.time())
@@ -1580,11 +1663,12 @@ async def stream_responses(upstream_key: str, model: str, payload: dict, conv_id
                             return idx
 
                         async for etype, data in iter_conversation_events(resp):
+                            got_event = True
                             if etype and len(seen_types) < 8:
                                 seen_types.append(etype)
                             if etype == "conversation.response.started":
                                 rid = data.get("conversation_id") or rid
-                                raw_usage = usage_from_event(data) or raw_usage
+                                raw_usage = merge_raw_usage(raw_usage, usage_from_event(data))
                                 for ev in ensure_created():
                                     yield ev
                                 continue
@@ -1596,7 +1680,7 @@ async def stream_responses(upstream_key: str, model: str, payload: dict, conv_id
                                 return
                             if etype in ("conversation.response.done", "done"):
                                 rid = (data or {}).get("conversation_id") or rid
-                                raw_usage = usage_from_event(data) or raw_usage
+                                raw_usage = merge_raw_usage(raw_usage, usage_from_event(data))
                                 break
 
                             for ev in ensure_created():
@@ -1830,19 +1914,23 @@ async def stream_responses(upstream_key: str, model: str, payload: dict, conv_id
 
                         items = [it for _, it in sorted(indexed, key=lambda p: p[0])]
                         rid = rid or f"resp_{int(time.time())}"
-                        usage = responses_usage_from_mistral(raw_usage)
+                        fields = mistral_usage_fields(raw_usage, rid)
+                        usage = responses_usage_from_fields(fields)
                         log.info(
-                            "responses done conv=%s types=%s tools=%s reason=%s usage=%s think=%d raw_usage_keys=%s",
+                            "responses done conv=%s types=%s tools=%s reason=%s usage=%s think=%d raw_usage=%s",
                             rid, seen_types, tool_names, reason,
                             f"{usage['input_tokens']}+{usage['output_tokens']}={usage['total_tokens']}"
-                            f" cache={usage['input_tokens_details'].get('cached_tokens', 0)}",
+                            f" {cache_log_label(fields)}",
                             len(reason_acc),
-                            sorted((raw_usage or {}).keys()),
+                            json.dumps(raw_usage, ensure_ascii=False)[:400] if raw_usage else "{}",
                         )
                         terminal = True
                         if entries and rid:
                             cache_conversation(
-                                rid, entries, function_call_entries_from_tool_state(tool_state),
+                                rid,
+                                entries,
+                                function_call_entries_from_tool_state(tool_state),
+                                prompt_tokens=usage.get("input_tokens") or 0,
                             )
                         yield _responses_event("response.completed", {
                             "type": "response.completed",
@@ -1852,10 +1940,13 @@ async def stream_responses(upstream_key: str, model: str, payload: dict, conv_id
                 except aiohttp.ClientError as e:
                     last_err = e
                     log.error(
-                        "connection error: %s (reason=%s attempt=%d/%d opened=%s)",
-                        e, reason, attempt, tries, opened,
+                        "connection error: %s (reason=%s attempt=%d/%d opened=%s got_event=%s)",
+                        e, reason, attempt, tries, opened, got_event,
                     )
-                    if opened or not is_transient_upstream(e) or attempt >= tries:
+                    # Already streamed tokens to the client — cannot retry in this
+                    # generator without duplicating SSE events. Keep the prefix
+                    # cache so the client's next request can append again.
+                    if got_event or not is_transient_upstream(e) or attempt >= tries:
                         if not terminal:
                             terminal = True
                             yield failed(str(e))
@@ -1956,11 +2047,12 @@ async def chat(request: Request):
 
     translated = mistral_to_openai(data, model)
     usage = translated.get("usage") or {}
+    fields = mistral_usage_fields(usage_from_event(data), translated.get("id"))
     log.info(
         "chat done conv=%s usage=%s raw_usage_keys=%s",
         translated.get("id"),
         f"{usage.get('prompt_tokens', 0)}+{usage.get('completion_tokens', 0)}={usage.get('total_tokens', 0)}"
-        f" cache={(usage.get('prompt_tokens_details') or {}).get('cached_tokens', 0)}",
+        f" {cache_log_label(fields)}",
         sorted((usage_from_event(data) or {}).keys()),
     )
     return Response(
@@ -2062,15 +2154,22 @@ async def responses(request: Request):
             return error_response(502, "Bad upstream response")
 
     translated = mistral_to_responses(data, model)
-    cache_conversation(translated.get("id"), entries, function_call_entries_from_outputs(data))
     usage = translated.get("usage") or {}
+    raw_usage = usage_from_event(data) or {}
+    fields = mistral_usage_fields(raw_usage, translated.get("id"))
+    cache_conversation(
+        translated.get("id"),
+        entries,
+        function_call_entries_from_outputs(data),
+        prompt_tokens=usage.get("input_tokens") or 0,
+    )
     log.info(
-        "responses done conv=%s reason=%s usage=%s raw_usage_keys=%s",
+        "responses done conv=%s reason=%s usage=%s raw_usage=%s",
         translated.get("id"),
         reason,
         f"{usage.get('input_tokens', 0)}+{usage.get('output_tokens', 0)}={usage.get('total_tokens', 0)}"
-        f" cache={(usage.get('input_tokens_details') or {}).get('cached_tokens', 0)}",
-        sorted((usage_from_event(data) or {}).keys()),
+        f" {cache_log_label(fields)}",
+        json.dumps(raw_usage, ensure_ascii=False)[:400] if raw_usage else "{}",
     )
     return Response(
         status_code=200,
