@@ -104,32 +104,9 @@ def content_to_text(content) -> str:
                     btype is None and "text" in block
                 ):
                     parts.append(block.get("text") or "")
-        return "".join(parts)
+        joined = "".join(parts)
+        return joined if joined else _as_json_string(content)
     return str(content)
-
-
-def openai_tool_call_to_entry(tc: dict):
-    """OpenAI tool_calls[] item -> Mistral FunctionCallEntry."""
-    if not isinstance(tc, dict):
-        return None
-    fn = tc.get("function") if isinstance(tc.get("function"), dict) else {}
-    name = fn.get("name") or tc.get("name")
-    if not name:
-        return None
-    args = fn.get("arguments", tc.get("arguments", "{}"))
-    if args is None:
-        args = "{}"
-    elif not isinstance(args, (str, dict)):
-        args = _as_json_string(args)
-    tcid = tc.get("id") or ""
-    if not tcid:
-        tcid = f"call_{name}"
-    return {
-        "type": "function.call",
-        "tool_call_id": str(tcid),
-        "name": str(name),
-        "arguments": args,
-    }
 
 
 def _preview_payload(value, limit: int = 200) -> tuple:
@@ -158,46 +135,149 @@ def _preview_payload(value, limit: int = 200) -> tuple:
     return type(value).__name__, len(dumped), dumped[:limit]
 
 
+def pick_tool_payload(item: dict) -> tuple:
+    """Which field holds the tool result, and its raw value."""
+    for key in ("output", "result", "content"):
+        if key in item:
+            return key, item.get(key)
+    return "missing", ""
+
+
+def tool_result_string(value) -> str:
+    """Preserve strings; flatten text blocks; otherwise JSON-dump so nothing is dropped."""
+    if value is None:
+        return ""
+    if isinstance(value, str):
+        return value
+    if isinstance(value, (int, float, bool)):
+        return str(value)
+    text = content_to_text(value)
+    if isinstance(value, list) and text.strip():
+        return text
+    if isinstance(value, dict) and isinstance(value.get("text"), str) and value["text"].strip():
+        return value["text"]
+    if text.strip() and not isinstance(value, (dict, list)):
+        return text
+    if isinstance(value, (dict, list)):
+        return _as_json_string(value)
+    return text or str(value)
+
+
 def _function_result_entry(tool_call_id: str, result) -> dict:
     return {
         "type": "function.result",
         "tool_call_id": str(tool_call_id),
-        "result": _as_json_string(result) if not isinstance(result, str) else result,
+        "result": tool_result_string(result),
     }
 
 
-def normalize_messages(messages: list) -> tuple:
-    """OpenAI/Anthropic messages -> (Mistral inputs, instructions).
+def emit_function_call(name, tcid, args, call_names=None):
+    """Build a Mistral function.call entry and log it. None if name is empty."""
+    if not name:
+        return None
+    if args is None:
+        args = "{}"
+    elif not isinstance(args, (str, dict)):
+        args = _as_json_string(args)
+    tcid = str(tcid or f"call_{name}")
+    if isinstance(call_names, dict):
+        call_names[tcid] = name
+    arg_preview = args if isinstance(args, str) else _as_json_string(args)
+    log.info(
+        "tool call in name=%s id=%s arg_len=%s preview=%r",
+        name,
+        tcid,
+        len(arg_preview or ""),
+        (arg_preview or "")[:200],
+    )
+    return {
+        "type": "function.call",
+        "tool_call_id": tcid,
+        "name": str(name),
+        "arguments": args,
+    }
 
-    assistant.tool_calls / Anthropic tool_use  -> function.call
-    role=tool / Anthropic tool_result          -> function.result
-    system / developer                         -> instructions
+
+def emit_function_result(item: dict, call_names=None):
+    """Build a Mistral function.result (or user fallback) and log the raw payload."""
+    tcid = item.get("call_id") or item.get("tool_call_id") or item.get("id") or item.get("name") or ""
+    field, result = pick_tool_payload(item)
+    kind, nbytes, preview = _preview_payload(result)
+    name = ""
+    if isinstance(call_names, dict):
+        name = call_names.get(str(tcid), "")
+    name = name or item.get("name") or ""
+    sent = None
+    if tcid:
+        sent = _function_result_entry(tcid, result)
+    else:
+        text = tool_result_string(result)
+        if text.strip():
+            sent = {"role": "user", "content": f"[tool result] {text}"}
+    sent_len = len((sent or {}).get("result") or (sent or {}).get("content") or "")
+    log.info(
+        "tool result in name=%s id=%s field=%s raw=%s raw_len=%s sent_len=%s keys=%s preview=%r",
+        name or "?",
+        tcid or "?",
+        field,
+        kind,
+        nbytes,
+        sent_len,
+        ",".join(item.keys()),
+        preview,
+    )
+    return sent
+
+
+def normalize_messages(messages: list) -> tuple:
+    """OpenAI/Anthropic/Responses-shaped messages -> (Mistral inputs, instructions).
+
+    assistant.tool_calls / function_call / Anthropic tool_use  -> function.call
+    role=tool / function / function_call_output / tool_result  -> function.result
+    system / developer                                         -> instructions
     """
     inputs = []
     instructions_parts = []
+    call_names = {}
 
     for m in messages:
+        if isinstance(m, str):
+            if m.strip():
+                inputs.append({"role": "user", "content": m})
+            continue
         if not isinstance(m, dict):
             continue
-        role = m.get("role", "")
+        role = m.get("role") or ""
+        itype = m.get("type") or ""
         content = m.get("content")
 
-        if role in ("system", "developer"):
+        if itype in ("function_call_output", "tool_result") or role in ("tool", "function"):
+            entry = emit_function_result(m, call_names)
+            if entry:
+                inputs.append(entry)
+            continue
+
+        if itype == "function_call" or (
+            role == "assistant" and m.get("name") and ("arguments" in m or "call_id" in m)
+        ):
+            name = m.get("name") or ""
+            if not name:
+                fn = m.get("function") if isinstance(m.get("function"), dict) else {}
+                name = fn.get("name") or ""
+            args = m.get("arguments", m.get("input", "{}"))
+            tcid = m.get("call_id") or m.get("id") or ""
+            entry = emit_function_call(name, tcid, args, call_names)
+            if entry:
+                inputs.append(entry)
+            continue
+
+        if role in ("system", "developer") or itype in ("system", "developer"):
             text = content_to_text(content)
             if text.strip():
                 instructions_parts.append(text)
             continue
 
-        if role in ("tool", "function"):
-            tcid = m.get("tool_call_id") or m.get("id") or m.get("name") or ""
-            result = content_to_text(content)
-            if tcid:
-                inputs.append(_function_result_entry(tcid, result))
-            elif result.strip():
-                inputs.append({"role": "user", "content": f"[tool result] {result}"})
-            continue
-
-        if role not in ("user", "assistant"):
+        if role not in ("user", "assistant", ""):
             continue
 
         openai_tcs = m.get("tool_calls") if isinstance(m.get("tool_calls"), list) else []
@@ -212,25 +292,26 @@ def normalize_messages(messages: list) -> tuple:
                 if not isinstance(block, dict):
                     continue
                 btype = block.get("type")
-                if btype == "tool_result":
-                    tcid = block.get("tool_use_id") or block.get("tool_call_id") or ""
-                    res = content_to_text(block.get("content"))
-                    if tcid:
-                        inputs.append(_function_result_entry(tcid, res))
-                    elif res.strip():
-                        leftover.append(res)
+                if btype in ("tool_result", "function_call_output"):
+                    entry = emit_function_result({
+                        "type": btype,
+                        "tool_call_id": block.get("tool_use_id") or block.get("tool_call_id") or block.get("call_id") or "",
+                        "call_id": block.get("call_id") or "",
+                        "name": block.get("name") or "",
+                        "content": block.get("content", block.get("output", block.get("result", ""))),
+                    }, call_names)
+                    if entry:
+                        inputs.append(entry)
                 elif btype == "tool_use" and not openai_tcs:
-                    tcid = block.get("id") or ""
-                    name = block.get("name") or ""
-                    args = block.get("input", {})
-                    if name:
-                        inputs.append({
-                            "type": "function.call",
-                            "tool_call_id": str(tcid or f"call_{name}"),
-                            "name": str(name),
-                            "arguments": args if isinstance(args, (dict, str)) else _as_json_string(args),
-                        })
-                elif btype == "thinking":
+                    entry = emit_function_call(
+                        block.get("name") or "",
+                        block.get("id") or "",
+                        block.get("input", {}),
+                        call_names,
+                    )
+                    if entry:
+                        inputs.append(entry)
+                elif btype in ("thinking", "reasoning"):
                     continue
                 elif btype in ("text", "output_text", "input_text") or (
                     btype is None and "text" in block
@@ -244,11 +325,29 @@ def normalize_messages(messages: list) -> tuple:
             if text.strip():
                 inputs.append({"role": "assistant", "content": text})
             for tc in openai_tcs:
-                entry = openai_tool_call_to_entry(tc)
+                name = ""
+                args = "{}"
+                tcid = ""
+                if isinstance(tc, dict):
+                    fn = tc.get("function") if isinstance(tc.get("function"), dict) else {}
+                    name = fn.get("name") or tc.get("name") or ""
+                    args = fn.get("arguments", tc.get("arguments", "{}"))
+                    tcid = tc.get("id") or tc.get("call_id") or ""
+                entry = emit_function_call(name, tcid, args, call_names)
+                if entry:
+                    inputs.append(entry)
+            legacy = m.get("function_call")
+            if isinstance(legacy, dict) and not openai_tcs:
+                entry = emit_function_call(
+                    legacy.get("name") or "",
+                    m.get("id") or "",
+                    legacy.get("arguments", "{}"),
+                    call_names,
+                )
                 if entry:
                     inputs.append(entry)
         elif text.strip():
-            inputs.append({"role": "user", "content": text})
+            inputs.append({"role": "user" if role != "assistant" else "assistant", "content": text})
 
     return inputs, "\n\n".join(instructions_parts)
 
@@ -471,106 +570,17 @@ def openai_to_mistral(body: dict) -> dict:
 
 
 def responses_input_to_entries(inp) -> tuple:
-    """Responses `input` -> (Conversations entries, extra instructions)."""
+    """Responses `input` -> same Conversations entries as Chat `messages`."""
     if inp is None:
         return [], ""
     if isinstance(inp, str):
         text = inp.strip()
         return ([{"role": "user", "content": text}] if text else []), ""
-
     if isinstance(inp, dict):
         inp = [inp]
     if not isinstance(inp, list):
         return [], ""
-
-    entries = []
-    extra_instr = []
-    call_names = {}
-    for item in inp:
-        if isinstance(item, str):
-            if item.strip():
-                entries.append({"role": "user", "content": item})
-            continue
-        if not isinstance(item, dict):
-            continue
-        itype = item.get("type") or ""
-        role = item.get("role") or ""
-
-        if itype in ("function_call_output", "tool_result") or role in ("tool", "function"):
-            tcid = item.get("call_id") or item.get("tool_call_id") or item.get("id") or ""
-            raw_field = next((k for k in ("output", "result", "content") if k in item), "missing")
-            result = item.get("output", item.get("result", item.get("content", "")))
-            kind, nbytes, preview = _preview_payload(result)
-            name = call_names.get(str(tcid), item.get("name") or "")
-            sent = None
-            if tcid:
-                sent = _function_result_entry(tcid, result)
-                entries.append(sent)
-            elif content_to_text(result).strip():
-                sent = {"role": "user", "content": f"[tool result] {content_to_text(result)}"}
-                entries.append(sent)
-            sent_len = len(sent.get("result") or sent.get("content") or "") if sent else 0
-            log.info(
-                "tool result in name=%s id=%s field=%s raw=%s raw_len=%s sent_len=%s keys=%s preview=%r",
-                name or "?",
-                tcid or "?",
-                raw_field,
-                kind,
-                nbytes,
-                sent_len,
-                ",".join(item.keys()),
-                preview,
-            )
-            continue
-
-        if itype == "function_call" or (role == "assistant" and item.get("name") and (
-            "arguments" in item or "call_id" in item
-        )):
-            name = item.get("name") or ""
-            if not name:
-                fn = item.get("function") if isinstance(item.get("function"), dict) else {}
-                name = fn.get("name") or ""
-            args = item.get("arguments", item.get("input", "{}"))
-            if not isinstance(args, (str, dict)):
-                args = _as_json_string(args)
-            tcid = item.get("call_id") or item.get("id") or (f"call_{name}" if name else "")
-            if name:
-                if tcid:
-                    call_names[str(tcid)] = name
-                entries.append({
-                    "type": "function.call",
-                    "tool_call_id": str(tcid or f"call_{name}"),
-                    "name": str(name),
-                    "arguments": args if args is not None else "{}",
-                })
-                arg_preview = args if isinstance(args, str) else _as_json_string(args)
-                log.info(
-                    "tool call in name=%s id=%s arg_len=%s preview=%r",
-                    name,
-                    tcid or "?",
-                    len(arg_preview or ""),
-                    (arg_preview or "")[:200],
-                )
-            continue
-
-        if role in ("system", "developer") or itype in ("system", "developer"):
-            text = content_to_text(item.get("content"))
-            if text.strip():
-                extra_instr.append(text)
-            continue
-
-        if role == "assistant" or (itype == "message" and role == "assistant"):
-            text = content_to_text(item.get("content"))
-            if text.strip():
-                entries.append({"role": "assistant", "content": text})
-            continue
-
-        text = content_to_text(item.get("content") if "content" in item else item.get("text"))
-        if not text and itype in ("input_text", "output_text"):
-            text = item.get("text") or ""
-        if text.strip():
-            entries.append({"role": "user", "content": text})
-    return entries, "\n\n".join(extra_instr)
+    return normalize_messages(inp)
 
 
 def responses_to_mistral(body: dict) -> dict:
@@ -848,14 +858,17 @@ def mistral_to_responses(data: dict, model: str) -> dict:
     }
 
 
-def _openai_chunk(model: str, delta: dict, finish_reason=None, chunk_id: str = "") -> dict:
-    return {
+def _openai_chunk(model: str, delta: dict, finish_reason=None, chunk_id: str = "", usage=None) -> dict:
+    chunk = {
         "id": chunk_id or f"chatcmpl-{int(time.time())}",
         "object": "chat.completion.chunk",
         "created": int(time.time()),
         "model": model,
         "choices": [{"index": 0, "delta": delta, "finish_reason": finish_reason}],
     }
+    if usage is not None:
+        chunk["usage"] = usage
+    return chunk
 
 
 def _args_fragment(prev: str, incoming: str) -> str:
@@ -1031,6 +1044,8 @@ async def stream_response(upstream_key: str, model: str, payload: dict):
                 tool_names = []
                 tool_state = {}
                 text_acc = ""
+                think_acc = ""
+                raw_usage = {}
 
                 def emit(delta: dict):
                     nonlocal yielded, sent_role
@@ -1050,6 +1065,7 @@ async def stream_response(upstream_key: str, model: str, payload: dict):
                         break
                     if etype == "conversation.response.started":
                         conv_id = data.get("conversation_id") or conv_id
+                        raw_usage = usage_from_event(data) or raw_usage
                         continue
                     if etype == "conversation.response.error":
                         msg = data.get("message") or "upstream stream error"
@@ -1058,6 +1074,7 @@ async def stream_response(upstream_key: str, model: str, payload: dict):
                         return
                     if etype == "conversation.response.done":
                         conv_id = data.get("conversation_id") or conv_id
+                        raw_usage = usage_from_event(data) or raw_usage
                         break
 
                     if etype == "message.output.delta":
@@ -1066,6 +1083,8 @@ async def stream_response(upstream_key: str, model: str, payload: dict):
                             continue
                         if delta.get("content"):
                             text_acc += delta["content"]
+                        if delta.get("reasoning_content"):
+                            think_acc += delta["reasoning_content"]
                         yield emit(delta)
                     elif etype == "function.call.delta":
                         tcid = data.get("tool_call_id") or data.get("id") or ""
@@ -1105,9 +1124,16 @@ async def stream_response(upstream_key: str, model: str, payload: dict):
                 if not sent_role:
                     yield emit({"content": ""})
                 finish_reason = "tool_calls" if saw_tool_call else "stop"
-                log.info("stream done conv=%s types=%s chunks=%d finish=%s tools=%s",
-                         conv_id, seen_types, yielded, finish_reason, tool_names)
-                yield f"data: {json.dumps(_openai_chunk(model, {}, finish_reason, chunk_id))}\n\n"
+                usage = chat_usage_from_mistral(raw_usage)
+                log.info(
+                    "stream done conv=%s types=%s chunks=%d finish=%s tools=%s usage=%s think=%d raw_usage_keys=%s",
+                    conv_id, seen_types, yielded, finish_reason, tool_names,
+                    f"{usage['prompt_tokens']}+{usage['completion_tokens']}={usage['total_tokens']}"
+                    f" cache={(usage.get('prompt_tokens_details') or {}).get('cached_tokens', 0)}",
+                    len(think_acc),
+                    sorted((raw_usage or {}).keys()),
+                )
+                yield f"data: {json.dumps(_openai_chunk(model, {}, finish_reason, chunk_id, usage))}\n\n"
                 yield "data: [DONE]\n\n"
         except aiohttp.ClientError as e:
             log.error("connection error: %s", e)
@@ -1565,10 +1591,19 @@ async def chat(request: Request):
             log.error("bad upstream JSON")
             return error_response(502, "Bad upstream response")
 
+    translated = mistral_to_openai(data, model)
+    usage = translated.get("usage") or {}
+    log.info(
+        "chat done conv=%s usage=%s raw_usage_keys=%s",
+        translated.get("id"),
+        f"{usage.get('prompt_tokens', 0)}+{usage.get('completion_tokens', 0)}={usage.get('total_tokens', 0)}"
+        f" cache={(usage.get('prompt_tokens_details') or {}).get('cached_tokens', 0)}",
+        sorted((usage_from_event(data) or {}).keys()),
+    )
     return Response(
         status_code=200,
         media_type="application/json",
-        content=json.dumps(mistral_to_openai(data, model)),
+        content=json.dumps(translated),
     )
 
 
