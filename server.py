@@ -552,6 +552,7 @@ def openai_to_mistral(body: dict) -> dict:
     if not isinstance(messages, list):
         messages = []
     inputs, instructions = normalize_messages(messages)
+    inputs = compact_settled_tools(inputs)
     if not inputs:
         inputs = [{"role": "user", "content": " "}]
 
@@ -583,10 +584,106 @@ def responses_input_to_entries(inp) -> tuple:
     return normalize_messages(inp)
 
 
+def _entry_kind(entry) -> str:
+    if not isinstance(entry, dict):
+        return "?"
+    return entry.get("type") or entry.get("role") or "?"
+
+
+def _preview_result_text(value, limit: int = 400) -> str:
+    text = tool_result_string(value) if not isinstance(value, str) else value
+    text = (text or "").replace("\n", " ").strip()
+    if len(text) <= limit:
+        return text
+    return text[:limit] + "…"
+
+
+def compact_settled_tools(entries: list) -> list:
+    """On create, fold completed historical tool pairs into assistant text.
+
+    Cursor/Claude Code replay the whole window as a new conversation.
+    Mistral create hangs / disconnects on hundreds of function.call +
+    function.result entries. Split at the last user message: keep that
+    turn native, fold earlier settled tool pairs.
+    """
+    if not entries:
+        return entries
+
+    kinds = [_entry_kind(e) for e in entries]
+    call_n = sum(1 for k in kinds if k == "function.call")
+    if call_n < 2:
+        return entries
+
+    last_user = -1
+    for i, kind in enumerate(kinds):
+        if kind == "user":
+            last_user = i
+    # Keep the last user turn (and anything after it) as native entries.
+    open_start = last_user if last_user >= 0 else len(entries)
+
+    out = []
+    i = 0
+    folded = 0
+    while i < len(entries):
+        if i >= open_start:
+            out.extend(entries[i:])
+            break
+        entry = entries[i]
+        kind = kinds[i]
+        if kind != "function.call":
+            out.append(entry)
+            i += 1
+            continue
+
+        j = i
+        names = []
+        results = []
+        pending = []
+        while j < open_start:
+            e = entries[j]
+            k = kinds[j]
+            if k == "function.call":
+                pending.append(e.get("tool_call_id") or "")
+                names.append(e.get("name") or "tool")
+            elif k == "function.result":
+                tcid = e.get("tool_call_id") or ""
+                if tcid in pending:
+                    pending.remove(tcid)
+                elif pending:
+                    pending.pop(0)
+                results.append(_preview_result_text(e.get("result")))
+            else:
+                break
+            j += 1
+            if not pending and j > i:
+                break
+        if pending:
+            out.append(entry)
+            i += 1
+            continue
+        label = ", ".join(names) or "tools"
+        body = " | ".join(r for r in results if r) or "(empty)"
+        out.append({"role": "assistant", "content": f"[tool {label}] {body}"})
+        folded += 1
+        i = j
+
+    if folded:
+        log.info(
+            "compact tools: %d→%d folded=%d open_from=%d calls=%d",
+            len(entries),
+            len(out),
+            folded,
+            open_start,
+            call_n,
+        )
+    return out
+
+
 def responses_to_mistral(body: dict) -> dict:
     """OpenAI Responses request -> Mistral conversations payload (create shape)."""
     inp = body.get("input", body.get("messages", []))
     entries, extra_instr = responses_input_to_entries(inp)
+    entries = compact_settled_tools(entries)
     instructions = body.get("instructions") or ""
     if extra_instr:
         instructions = "\n\n".join(p for p in (instructions, extra_instr) if p)
