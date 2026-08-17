@@ -17,6 +17,8 @@ import os
 import time
 import json
 import logging
+import asyncio
+import hashlib
 
 import aiohttp
 import uvicorn
@@ -26,11 +28,20 @@ from fastapi.responses import StreamingResponse
 # ── Config ───────────────────────────────────────────────────────────────────
 MISTRAL_KEY  = os.environ.get("MISTRAL_KEY", "")
 MODEL        = os.environ.get("BRIDGE_MODEL", "glm-5-2")
-PORT         = int(os.environ.get("BRIDGE_PORT", 8090))
+PORT         = int(os.environ.get("BRIDGE_PORT", 8577))
 HOST         = os.environ.get("BRIDGE_HOST", "0.0.0.0")
 MISTRAL_API  = "https://api.mistral.ai/v1"
 MISTRAL_BASE = f"{MISTRAL_API}/conversations"
 UPSTREAM_TIMEOUT = aiohttp.ClientTimeout(total=300)
+# Mistral sometimes drops the TCP handshake / first bytes on create.
+# Retry locally so AxonHub does not see an empty SSE and replay the turn.
+CREATE_CONNECT_RETRIES = 3
+CREATE_RETRY_BACKOFF = 0.4
+APPEND_CONFLICT_RETRIES = 4
+APPEND_CONFLICT_BACKOFF = 0.4
+
+_conv_cache: dict[str, tuple[str, int, list]] = {}
+_CONV_CACHE_LIMIT = 64
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger("mistral-bridge")
@@ -504,6 +515,136 @@ def extract_previous_id(body: dict, request: Request):
     return None
 
 
+def _entries_hash(entries: list) -> str:
+    blob = json.dumps(entries, ensure_ascii=False, sort_keys=True)
+    return hashlib.sha256(blob.encode()).hexdigest()
+
+
+def find_append_match(entries: list):
+    """Find a cached conversation whose entries are a prefix of current entries.
+
+    Prefer the longest prefix so an older shorter cache for the same thread
+    cannot win and re-append history Mistral already has.
+    Returns (conv_id, new_entries_to_append) or None.
+    """
+    if len(entries) < 2:
+        return None
+    best = None
+    best_len = -1
+    for prefix_hash, (conv_id, cached_len, cached_entries) in _conv_cache.items():
+        if cached_len >= len(entries) or cached_len <= best_len:
+            continue
+        if _entries_hash(entries[:cached_len]) != prefix_hash:
+            continue
+        new_entries = skip_replayed_function_calls(entries[cached_len:])
+        if not new_entries:
+            continue
+        best = (conv_id, new_entries)
+        best_len = cached_len
+    return best
+
+
+def skip_replayed_function_calls(entries: list) -> list:
+    """Drop function.call entries that this same batch later settles.
+
+    After a tool-call turn Mistral already has those calls as model output.
+    Re-appending them is 'other inputs' while results are still missing.
+    """
+    settled_ids = {
+        item.get("tool_call_id")
+        for item in entries
+        if isinstance(item, dict)
+        and item.get("type") == "function.result"
+        and item.get("tool_call_id")
+    }
+    if not settled_ids:
+        return entries
+    kept = []
+    skipped = 0
+    for item in entries:
+        if (
+            isinstance(item, dict)
+            and item.get("type") == "function.call"
+            and item.get("tool_call_id") in settled_ids
+        ):
+            skipped += 1
+            continue
+        kept.append(item)
+    if skipped:
+        log.info("append skip replayed calls=%d remaining=%d", skipped, len(kept))
+    return kept
+
+
+def function_call_entries_from_outputs(data) -> list:
+    """Rebuild native function.call entries from a non-stream Mistral response."""
+    calls = []
+    if not isinstance(data, dict):
+        return calls
+    for item in data.get("outputs") or []:
+        if not isinstance(item, dict) or item.get("type") != "function.call":
+            continue
+        name = item.get("name") or ""
+        if not name:
+            continue
+        args = item.get("arguments", "{}")
+        if not isinstance(args, (str, dict)):
+            args = _as_json_string(args)
+        calls.append({
+            "type": "function.call",
+            "tool_call_id": str(item.get("tool_call_id") or item.get("id") or f"call_{name}"),
+            "name": str(name),
+            "arguments": args,
+        })
+    return calls
+
+
+def function_call_entries_from_tool_state(tool_state: dict) -> list:
+    """Rebuild native function.call entries from a stream's accumulated tool_state."""
+    calls = []
+    ordered = sorted(
+        (tool_state or {}).items(),
+        key=lambda kv: (kv[1] or {}).get("index", 0),
+    )
+    for tool_call_id, state in ordered:
+        name = (state or {}).get("name") or ""
+        if not name:
+            continue
+        calls.append({
+            "type": "function.call",
+            "tool_call_id": str(tool_call_id),
+            "name": str(name),
+            "arguments": state.get("args") or "{}",
+        })
+    return calls
+
+
+def cache_conversation(conv_id: str, entries: list, extra_entries: list = None):
+    """Remember the client request now stored on this conversation.
+
+    extra_entries is ignored: reconstructed model function.calls rarely hash
+    equal to the client's replay, and skip_replayed_function_calls already
+    strips those calls from the next append.
+    """
+    if not conv_id or conv_id.startswith("resp_"):
+        return
+    stored = list(entries or [])
+    if not stored:
+        return
+    evict_conversation(conv_id)
+    prefix_hash = _entries_hash(stored)
+    _conv_cache[prefix_hash] = (conv_id, len(stored), stored)
+    while len(_conv_cache) > _CONV_CACHE_LIMIT:
+        _conv_cache.pop(next(iter(_conv_cache)))
+
+
+def evict_conversation(conv_id: str):
+    if not conv_id:
+        return
+    stale_keys = [key for key, (cached_id, _, _) in _conv_cache.items() if cached_id == conv_id]
+    for key in stale_keys:
+        _conv_cache.pop(key, None)
+
+
 def strip_for_append(payload: dict) -> dict:
     """AppendConversationRequest forbids model/instructions/tools."""
     out = {"inputs": payload.get("inputs") or []}
@@ -520,17 +661,25 @@ def strip_for_append(payload: dict) -> dict:
     return out
 
 
+def concurrent_conversation(status: int, text: str) -> bool:
+    """True when append raced another in-flight update (often also code 3000)."""
+    if status == 409:
+        return True
+    lowered = (text or "").lower()
+    return "concurrent" in lowered or "being updated" in lowered
+
+
 def missing_conversation(status: int, text: str) -> bool:
-    """True when append targeted an id Mistral does not have (code 3000)."""
+    """True when append targeted an id Mistral does not have."""
     if status == 404:
         return True
+    if concurrent_conversation(status, text):
+        return False
     try:
         obj = json.loads(text or "")
     except (TypeError, ValueError, json.JSONDecodeError):
         obj = None
     if isinstance(obj, dict):
-        if obj.get("code") == 3000 or str(obj.get("code")) == "3000":
-            return True
         msg = str(obj.get("message") or "")
         if "was not found" in msg or "Conversation with id" in msg:
             return True
@@ -538,11 +687,44 @@ def missing_conversation(status: int, text: str) -> bool:
     return "was not found" in lowered or "conversation with id" in lowered
 
 
-def conversation_attempts(payload: dict, conv_id: str):
+def append_state_mismatch(status: int, text: str) -> bool:
+    """True when this conversation cannot accept the append payload."""
+    if status != 400:
+        return False
+    lowered = (text or "").lower()
+    return (
+        "function results are still missing" in lowered
+        or "cannot append other inputs" in lowered
+    )
+
+
+def append_should_fallback(status: int, text: str) -> bool:
+    return missing_conversation(status, text) or append_state_mismatch(status, text)
+
+
+def conversation_attempts(payload: dict, conv_id: str, append_payload: dict = None):
     """(url, body, reason) pairs. Append first when an id is present; create is fallback."""
     if conv_id:
-        yield f"{MISTRAL_BASE}/{conv_id}", strip_for_append(payload), "append"
+        yield f"{MISTRAL_BASE}/{conv_id}", (append_payload or strip_for_append(payload)), "append"
     yield MISTRAL_BASE, payload, "create"
+
+
+def is_transient_upstream(err: BaseException) -> bool:
+    """True when Mistral dropped the socket before a usable HTTP/SSE body."""
+    if isinstance(err, (
+        aiohttp.ClientConnectorError,
+        aiohttp.ServerDisconnectedError,
+        aiohttp.ClientPayloadError,
+        aiohttp.ClientOSError,
+    )):
+        return True
+    msg = str(err).lower()
+    return (
+        "disconnected" in msg
+        or "cannot connect" in msg
+        or "not enough data" in msg
+        or "transfer encoding" in msg
+    )
 
 
 # ── Request translation ───────────────────────────────────────────────────────
@@ -679,20 +861,27 @@ def compact_settled_tools(entries: list) -> list:
     return out
 
 
-def responses_to_mistral(body: dict) -> dict:
-    """OpenAI Responses request -> Mistral conversations payload (create shape)."""
+def responses_to_mistral(body: dict) -> tuple:
+    """OpenAI Responses request -> (create payload, uncompacted entries).
+
+    Compact only the create payload. Append matching must see native
+    function.call / function.result ids or it will skip pending results.
+    """
     inp = body.get("input", body.get("messages", []))
     entries, extra_instr = responses_input_to_entries(inp)
-    entries = compact_settled_tools(entries)
+    match_entries = entries
+    compacted = compact_settled_tools(entries)
+    if not compacted:
+        compacted = [{"role": "user", "content": " "}]
+        if not match_entries:
+            match_entries = compacted
     instructions = body.get("instructions") or ""
     if extra_instr:
         instructions = "\n\n".join(p for p in (instructions, extra_instr) if p)
-    if not entries:
-        entries = [{"role": "user", "content": " "}]
 
     payload = {
         "model": resolve_model(body.get("model")),
-        "inputs": entries,
+        "inputs": compacted,
         "completion_args": completion_args_from_body(body),
         "store": store_from_body(body, True),
     }
@@ -701,7 +890,7 @@ def responses_to_mistral(body: dict) -> dict:
     tools = normalize_tools(body.get("tools"), body.get("functions"))
     if tools:
         payload["tools"] = tools
-    return payload
+    return payload, match_entries
 
 
 # ── Response translation ──────────────────────────────────────────────────────
@@ -1095,23 +1284,49 @@ def input_kinds(inputs) -> list:
 
 
 # ── Upstream POST (create / append / one create-after-miss) ───────────────────
-async def post_conversation(session, key: str, payload: dict, conv_id: str = None):
-    """POST create or append. On append 404/3000, retry once as create.
+async def post_conversation(session, key: str, payload: dict, conv_id: str = None, append_payload: dict = None):
+    """POST create or append. On append miss / tool-state mismatch, retry as create.
 
+    Concurrent 409 is retried as append, not treated as a missing conversation.
     Returns (resp, reason, error_text). Caller must read resp / close it.
     """
     last_text = ""
-    for url, body, reason in conversation_attempts(payload, conv_id):
-        resp = await session.post(url, headers=_auth_headers(key), json=body, timeout=UPSTREAM_TIMEOUT)
-        if resp.status == 200:
-            if reason == "create" and conv_id:
-                log.info("append %s missing → create", conv_id)
-            return resp, reason, ""
-        last_text = await resp.text()
-        log.warning("upstream %s %s: %s", reason, resp.status, last_text[:200])
-        if reason == "append" and missing_conversation(resp.status, last_text):
-            continue
-        return resp, reason, last_text
+    resp = None
+    for url, body, reason in conversation_attempts(payload, conv_id, append_payload):
+        tries = CREATE_CONNECT_RETRIES if reason == "create" else APPEND_CONFLICT_RETRIES
+        for attempt in range(1, tries + 1):
+            try:
+                resp = await session.post(
+                    url, headers=_auth_headers(key), json=body, timeout=UPSTREAM_TIMEOUT,
+                )
+                if resp.status == 200:
+                    if reason == "create" and conv_id:
+                        log.info("append %s missing → create", conv_id)
+                    return resp, reason, ""
+                last_text = await resp.text()
+                log.warning("upstream %s %s: %s", reason, resp.status, last_text[:200])
+                if reason == "append" and concurrent_conversation(resp.status, last_text):
+                    if attempt < tries:
+                        log.info(
+                            "append %s concurrent, retry in %ss",
+                            conv_id, APPEND_CONFLICT_BACKOFF * attempt,
+                        )
+                        await asyncio.sleep(APPEND_CONFLICT_BACKOFF * attempt)
+                        continue
+                    return resp, reason, last_text
+                if reason == "append" and append_should_fallback(resp.status, last_text):
+                    if append_state_mismatch(resp.status, last_text):
+                        evict_conversation(conv_id)
+                        log.info("append %s state mismatch → create", conv_id)
+                    else:
+                        log.info("append %s missing → create", conv_id)
+                    break
+                return resp, reason, last_text
+            except aiohttp.ClientError as e:
+                log.error("connection error: %s (reason=%s attempt=%d/%d)", e, reason, attempt, tries)
+                if not is_transient_upstream(e) or attempt >= tries:
+                    raise
+                await asyncio.sleep(CREATE_RETRY_BACKOFF * attempt)
     return resp, "create", last_text
 
 
@@ -1120,7 +1335,10 @@ async def stream_response(upstream_key: str, model: str, payload: dict):
     """SSE proxy: Mistral conversations stream -> OpenAI chat.completion.chunk."""
     chunk_id = f"chatcmpl-{int(time.time())}"
     conv_id = None
+    last_err = None
     async with aiohttp.ClientSession() as session:
+      for attempt in range(1, CREATE_CONNECT_RETRIES + 1):
+        opened = False
         try:
             async with session.post(
                 MISTRAL_BASE,
@@ -1134,6 +1352,7 @@ async def stream_response(upstream_key: str, model: str, payload: dict):
                     yield f"data: {json.dumps({'error': {'message': text[:500], 'type': 'upstream_error'}})}\n\n"
                     return
 
+                opened = True
                 saw_tool_call = False
                 sent_role = False
                 yielded = 0
@@ -1232,12 +1451,20 @@ async def stream_response(upstream_key: str, model: str, payload: dict):
                 )
                 yield f"data: {json.dumps(_openai_chunk(model, {}, finish_reason, chunk_id, usage))}\n\n"
                 yield "data: [DONE]\n\n"
+                return
         except aiohttp.ClientError as e:
-            log.error("connection error: %s", e)
-            yield f"data: {json.dumps({'error': {'message': str(e), 'type': 'upstream_unreachable'}})}\n\n"
+            last_err = e
+            log.error("connection error: %s (attempt=%d/%d opened=%s)", e, attempt, CREATE_CONNECT_RETRIES, opened)
+            if opened or not is_transient_upstream(e) or attempt >= CREATE_CONNECT_RETRIES:
+                yield f"data: {json.dumps({'error': {'message': str(e), 'type': 'upstream_unreachable'}})}\n\n"
+                return
+            log.warning("retry create after disconnect in %ss", CREATE_RETRY_BACKOFF * attempt)
+            await asyncio.sleep(CREATE_RETRY_BACKOFF * attempt)
+      if last_err is not None:
+          yield f"data: {json.dumps({'error': {'message': str(last_err), 'type': 'upstream_unreachable'}})}\n\n"
 
 
-async def stream_responses(upstream_key: str, model: str, payload: dict, conv_id: str = None):
+async def stream_responses(upstream_key: str, model: str, payload: dict, conv_id: str = None, entries: list = None, append_payload: dict = None):
     """SSE proxy: Mistral conversations stream -> OpenAI Responses events.
 
     Clients treat a stream without output_text.done / function_call_arguments.done
@@ -1251,358 +1478,395 @@ async def stream_responses(upstream_key: str, model: str, payload: dict, conv_id
             "response": {"id": rid, "error": {"message": message}},
         })
 
+    last_err = None
     async with aiohttp.ClientSession() as session:
-        try:
-            for url, body, reason in conversation_attempts(payload, conv_id):
-                async with session.post(
-                    url,
-                    headers=_auth_headers(upstream_key),
-                    json=body,
-                    timeout=UPSTREAM_TIMEOUT,
-                ) as resp:
-                    if resp.status != 200:
-                        last_text = await resp.text()
-                        log.warning("upstream %s %s: %s", reason, resp.status, last_text[:200])
-                        if reason == "append" and missing_conversation(resp.status, last_text):
-                            log.info("append %s missing → create", conv_id)
-                            continue
-                        terminal = True
-                        yield failed(last_text[:500])
-                        return
+        for url, body, reason in conversation_attempts(payload, conv_id, append_payload):
+            tries = CREATE_CONNECT_RETRIES if reason == "create" else APPEND_CONFLICT_RETRIES
+            for attempt in range(1, tries + 1):
+                opened = False
+                try:
+                    async with session.post(
+                        url,
+                        headers=_auth_headers(upstream_key),
+                        json=body,
+                        timeout=UPSTREAM_TIMEOUT,
+                    ) as resp:
+                        if resp.status != 200:
+                            last_text = await resp.text()
+                            log.warning("upstream %s %s: %s", reason, resp.status, last_text[:200])
+                            if reason == "append" and concurrent_conversation(resp.status, last_text):
+                                if attempt < tries:
+                                    log.info(
+                                        "append %s concurrent, retry in %ss",
+                                        conv_id, APPEND_CONFLICT_BACKOFF * attempt,
+                                    )
+                                    await asyncio.sleep(APPEND_CONFLICT_BACKOFF * attempt)
+                                    continue
+                                terminal = True
+                                yield failed(last_text[:500])
+                                return
+                            if reason == "append" and append_should_fallback(resp.status, last_text):
+                                if append_state_mismatch(resp.status, last_text):
+                                    evict_conversation(conv_id)
+                                    log.info("append %s state mismatch → create", conv_id)
+                                else:
+                                    log.info("append %s missing → create", conv_id)
+                                break
+                            terminal = True
+                            yield failed(last_text[:500])
+                            return
 
-                    log.info("responses stream %s", reason)
-                    created_sent = False
-                    seq = 0
-                    next_out = 0
-                    text_item_id = "msg_0"
-                    text_index = 0
-                    text_started = False
-                    text_acc = ""
-                    reason_item_id = "rs_0"
-                    reason_index = 0
-                    reason_started = False
-                    reason_acc = ""
-                    tool_state = {}
-                    seen_types = []
-                    raw_usage = {}
-                    # Never advertise a client-local id on a create fallback.
-                    rid = conv_id if reason == "append" else ""
-                    created_at = int(time.time())
+                        opened = True
+                        log.info("responses stream %s", reason)
+                        created_sent = False
+                        seq = 0
+                        next_out = 0
+                        text_item_id = "msg_0"
+                        text_index = 0
+                        text_started = False
+                        text_acc = ""
+                        reason_item_id = "rs_0"
+                        reason_index = 0
+                        reason_started = False
+                        reason_acc = ""
+                        tool_state = {}
+                        seen_types = []
+                        raw_usage = {}
+                        # Never advertise a client-local id on a create fallback.
+                        rid = conv_id if reason == "append" else ""
+                        created_at = int(time.time())
 
-                    def next_seq():
-                        nonlocal seq
-                        seq += 1
-                        return seq
+                        def next_seq():
+                            nonlocal seq
+                            seq += 1
+                            return seq
 
-                    def response_obj(status: str, output=None, usage=None):
-                        obj = {
-                            "id": rid or f"resp_{int(time.time())}",
-                            "object": "response",
-                            "created_at": created_at,
-                            "model": model,
-                            "status": status,
-                            "output": output if output is not None else [],
-                        }
-                        if usage is not None:
-                            obj["usage"] = usage
-                        return obj
+                        def response_obj(status: str, output=None, usage=None):
+                            obj = {
+                                "id": rid or f"resp_{int(time.time())}",
+                                "object": "response",
+                                "created_at": created_at,
+                                "model": model,
+                                "status": status,
+                                "output": output if output is not None else [],
+                            }
+                            if usage is not None:
+                                obj["usage"] = usage
+                            return obj
 
-                    def ensure_created():
-                        nonlocal created_sent
-                        if created_sent:
-                            return []
-                        created_sent = True
-                        obj = response_obj("in_progress")
-                        return [
-                            _responses_event("response.created", {
-                                "type": "response.created",
-                                "response": obj,
-                            }),
-                            _responses_event("response.in_progress", {
-                                "type": "response.in_progress",
-                                "response": obj,
-                            }),
-                        ]
+                        def ensure_created():
+                            nonlocal created_sent
+                            if created_sent:
+                                return []
+                            created_sent = True
+                            obj = response_obj("in_progress")
+                            return [
+                                _responses_event("response.created", {
+                                    "type": "response.created",
+                                    "response": obj,
+                                }),
+                                _responses_event("response.in_progress", {
+                                    "type": "response.in_progress",
+                                    "response": obj,
+                                }),
+                            ]
 
-                    def take_index():
-                        nonlocal next_out
-                        idx = next_out
-                        next_out += 1
-                        return idx
+                        def take_index():
+                            nonlocal next_out
+                            idx = next_out
+                            next_out += 1
+                            return idx
 
-                    async for etype, data in iter_conversation_events(resp):
-                        if etype and len(seen_types) < 8:
-                            seen_types.append(etype)
-                        if etype == "conversation.response.started":
-                            rid = data.get("conversation_id") or rid
-                            raw_usage = usage_from_event(data) or raw_usage
+                        async for etype, data in iter_conversation_events(resp):
+                            if etype and len(seen_types) < 8:
+                                seen_types.append(etype)
+                            if etype == "conversation.response.started":
+                                rid = data.get("conversation_id") or rid
+                                raw_usage = usage_from_event(data) or raw_usage
+                                for ev in ensure_created():
+                                    yield ev
+                                continue
+                            if etype == "conversation.response.error":
+                                msg = data.get("message") or "upstream stream error"
+                                log.warning("stream error: %s", msg)
+                                terminal = True
+                                yield failed(msg, rid)
+                                return
+                            if etype in ("conversation.response.done", "done"):
+                                rid = (data or {}).get("conversation_id") or rid
+                                raw_usage = usage_from_event(data) or raw_usage
+                                break
+
                             for ev in ensure_created():
                                 yield ev
-                            continue
-                        if etype == "conversation.response.error":
-                            msg = data.get("message") or "upstream stream error"
-                            log.warning("stream error: %s", msg)
-                            terminal = True
-                            yield failed(msg, rid)
-                            return
-                        if etype in ("conversation.response.done", "done"):
-                            rid = (data or {}).get("conversation_id") or rid
-                            raw_usage = usage_from_event(data) or raw_usage
-                            break
+
+                            if etype == "message.output.delta":
+                                delta = _delta_from_message_content(data.get("content"))
+                                if not delta:
+                                    continue
+                                thought = delta.get("reasoning_content") or ""
+                                if thought:
+                                    reason_acc += thought
+                                    if not reason_started:
+                                        reason_started = True
+                                        reason_index = take_index()
+                                        item = {
+                                            "type": "reasoning",
+                                            "id": reason_item_id,
+                                            "summary": [{"type": "summary_text", "text": ""}],
+                                        }
+                                        yield _responses_event("response.output_item.added", {
+                                            "type": "response.output_item.added",
+                                            "output_index": reason_index,
+                                            "item": item,
+                                            "sequence_number": next_seq(),
+                                        })
+                                        yield _responses_event("response.reasoning_summary_part.added", {
+                                            "type": "response.reasoning_summary_part.added",
+                                            "item_id": reason_item_id,
+                                            "output_index": reason_index,
+                                            "summary_index": 0,
+                                            "part": {"type": "summary_text", "text": ""},
+                                            "sequence_number": next_seq(),
+                                        })
+                                    yield _responses_event("response.reasoning_summary_text.delta", {
+                                        "type": "response.reasoning_summary_text.delta",
+                                        "item_id": reason_item_id,
+                                        "output_index": reason_index,
+                                        "summary_index": 0,
+                                        "delta": thought,
+                                        "sequence_number": next_seq(),
+                                    })
+                                text = delta.get("content") or ""
+                                if not text:
+                                    continue
+                                text_acc += text
+                                if not text_started:
+                                    text_started = True
+                                    text_index = take_index()
+                                    item = {
+                                        "type": "message",
+                                        "id": text_item_id,
+                                        "role": "assistant",
+                                        "status": "in_progress",
+                                        "content": [{"type": "output_text", "text": ""}],
+                                    }
+                                    yield _responses_event("response.output_item.added", {
+                                        "type": "response.output_item.added",
+                                        "output_index": text_index,
+                                        "item": item,
+                                        "sequence_number": next_seq(),
+                                    })
+                                    yield _responses_event("response.content_part.added", {
+                                        "type": "response.content_part.added",
+                                        "item_id": text_item_id,
+                                        "output_index": text_index,
+                                        "content_index": 0,
+                                        "part": {"type": "output_text", "text": ""},
+                                        "sequence_number": next_seq(),
+                                    })
+                                yield _responses_event("response.output_text.delta", {
+                                    "type": "response.output_text.delta",
+                                    "item_id": text_item_id,
+                                    "output_index": text_index,
+                                    "content_index": 0,
+                                    "delta": text,
+                                    "sequence_number": next_seq(),
+                                })
+                            elif etype == "function.call.delta":
+                                tcid = data.get("tool_call_id") or data.get("id") or ""
+                                name = data.get("name") or ""
+                                incoming = data.get("arguments")
+                                if incoming is None:
+                                    incoming = ""
+                                elif not isinstance(incoming, str):
+                                    incoming = _as_json_string(incoming)
+                                if tcid not in tool_state:
+                                    tool_state[tcid] = {
+                                        "index": len(tool_state),
+                                        "args": "",
+                                        "item_id": tcid or f"fc_{len(tool_state)}",
+                                        "announced": False,
+                                        "output_index": None,
+                                    }
+                                state = tool_state[tcid]
+                                frag = _args_fragment(state["args"], incoming)
+                                state["args"] += frag
+                                if name:
+                                    state["name"] = name
+                                if not state["announced"] and state.get("name"):
+                                    state["announced"] = True
+                                    state["output_index"] = take_index()
+                                    yield _responses_event("response.output_item.added", {
+                                        "type": "response.output_item.added",
+                                        "output_index": state["output_index"],
+                                        "item": {
+                                            "type": "function_call",
+                                            "id": state["item_id"],
+                                            "call_id": tcid,
+                                            "name": state["name"],
+                                            "arguments": "",
+                                        },
+                                        "sequence_number": next_seq(),
+                                    })
+                                if frag and state.get("output_index") is not None:
+                                    yield _responses_event("response.function_call_arguments.delta", {
+                                        "type": "response.function_call_arguments.delta",
+                                        "item_id": state["item_id"],
+                                        "output_index": state["output_index"],
+                                        "delta": frag,
+                                        "sequence_number": next_seq(),
+                                    })
 
                         for ev in ensure_created():
                             yield ev
 
-                        if etype == "message.output.delta":
-                            delta = _delta_from_message_content(data.get("content"))
-                            if not delta:
-                                continue
-                            thought = delta.get("reasoning_content") or ""
-                            if thought:
-                                reason_acc += thought
-                                if not reason_started:
-                                    reason_started = True
-                                    reason_index = take_index()
-                                    item = {
-                                        "type": "reasoning",
-                                        "id": reason_item_id,
-                                        "summary": [{"type": "summary_text", "text": ""}],
-                                    }
-                                    yield _responses_event("response.output_item.added", {
-                                        "type": "response.output_item.added",
-                                        "output_index": reason_index,
-                                        "item": item,
-                                        "sequence_number": next_seq(),
-                                    })
-                                    yield _responses_event("response.reasoning_summary_part.added", {
-                                        "type": "response.reasoning_summary_part.added",
-                                        "item_id": reason_item_id,
-                                        "output_index": reason_index,
-                                        "summary_index": 0,
-                                        "part": {"type": "summary_text", "text": ""},
-                                        "sequence_number": next_seq(),
-                                    })
-                                yield _responses_event("response.reasoning_summary_text.delta", {
-                                    "type": "response.reasoning_summary_text.delta",
-                                    "item_id": reason_item_id,
-                                    "output_index": reason_index,
-                                    "summary_index": 0,
-                                    "delta": thought,
-                                    "sequence_number": next_seq(),
-                                })
-                            text = delta.get("content") or ""
-                            if not text:
-                                continue
-                            text_acc += text
-                            if not text_started:
-                                text_started = True
-                                text_index = take_index()
-                                item = {
-                                    "type": "message",
-                                    "id": text_item_id,
-                                    "role": "assistant",
-                                    "status": "in_progress",
-                                    "content": [{"type": "output_text", "text": ""}],
-                                }
-                                yield _responses_event("response.output_item.added", {
-                                    "type": "response.output_item.added",
-                                    "output_index": text_index,
-                                    "item": item,
-                                    "sequence_number": next_seq(),
-                                })
-                                yield _responses_event("response.content_part.added", {
-                                    "type": "response.content_part.added",
-                                    "item_id": text_item_id,
-                                    "output_index": text_index,
-                                    "content_index": 0,
-                                    "part": {"type": "output_text", "text": ""},
-                                    "sequence_number": next_seq(),
-                                })
-                            yield _responses_event("response.output_text.delta", {
-                                "type": "response.output_text.delta",
+                        indexed = []
+                        if reason_started:
+                            reason_item = {
+                                "type": "reasoning",
+                                "id": reason_item_id,
+                                "summary": [{"type": "summary_text", "text": reason_acc}],
+                            }
+                            indexed.append((reason_index, reason_item))
+                            yield _responses_event("response.reasoning_summary_text.done", {
+                                "type": "response.reasoning_summary_text.done",
+                                "item_id": reason_item_id,
+                                "output_index": reason_index,
+                                "summary_index": 0,
+                                "text": reason_acc,
+                                "sequence_number": next_seq(),
+                            })
+                            yield _responses_event("response.reasoning_summary_part.done", {
+                                "type": "response.reasoning_summary_part.done",
+                                "item_id": reason_item_id,
+                                "output_index": reason_index,
+                                "summary_index": 0,
+                                "part": {"type": "summary_text", "text": reason_acc},
+                                "sequence_number": next_seq(),
+                            })
+                            yield _responses_event("response.output_item.done", {
+                                "type": "response.output_item.done",
+                                "output_index": reason_index,
+                                "item": reason_item,
+                                "sequence_number": next_seq(),
+                            })
+
+                        if text_started:
+                            text_item = {
+                                "type": "message",
+                                "id": text_item_id,
+                                "role": "assistant",
+                                "status": "completed",
+                                "content": [{"type": "output_text", "text": text_acc}],
+                            }
+                            indexed.append((text_index, text_item))
+                            yield _responses_event("response.output_text.done", {
+                                "type": "response.output_text.done",
                                 "item_id": text_item_id,
                                 "output_index": text_index,
                                 "content_index": 0,
-                                "delta": text,
+                                "text": text_acc,
                                 "sequence_number": next_seq(),
                             })
-                        elif etype == "function.call.delta":
-                            tcid = data.get("tool_call_id") or data.get("id") or ""
-                            name = data.get("name") or ""
-                            incoming = data.get("arguments")
-                            if incoming is None:
-                                incoming = ""
-                            elif not isinstance(incoming, str):
-                                incoming = _as_json_string(incoming)
-                            if tcid not in tool_state:
-                                tool_state[tcid] = {
-                                    "index": len(tool_state),
-                                    "args": "",
-                                    "item_id": tcid or f"fc_{len(tool_state)}",
-                                    "announced": False,
-                                    "output_index": None,
-                                }
-                            state = tool_state[tcid]
-                            frag = _args_fragment(state["args"], incoming)
-                            state["args"] += frag
-                            if name:
-                                state["name"] = name
-                            if not state["announced"] and state.get("name"):
-                                state["announced"] = True
+                            yield _responses_event("response.content_part.done", {
+                                "type": "response.content_part.done",
+                                "item_id": text_item_id,
+                                "output_index": text_index,
+                                "content_index": 0,
+                                "part": {"type": "output_text", "text": text_acc},
+                                "sequence_number": next_seq(),
+                            })
+                            yield _responses_event("response.output_item.done", {
+                                "type": "response.output_item.done",
+                                "output_index": text_index,
+                                "item": text_item,
+                                "sequence_number": next_seq(),
+                            })
+
+                        tool_names = []
+                        for tcid, state in sorted(tool_state.items(), key=lambda kv: kv[1]["index"]):
+                            name = state.get("name") or ""
+                            args = state.get("args") or "{}"
+                            if not name:
+                                continue
+                            tool_names.append(name)
+                            if state.get("output_index") is None:
                                 state["output_index"] = take_index()
+                            idx = state["output_index"]
+                            item = {
+                                "type": "function_call",
+                                "id": state["item_id"],
+                                "call_id": tcid,
+                                "name": name,
+                                "arguments": args,
+                            }
+                            indexed.append((idx, item))
+                            preview = args if len(args) < 200 else args[:200] + "…"
+                            log.info("tool call id=%s name=%s args=%s", tcid, name, preview)
+                            if not state.get("announced"):
                                 yield _responses_event("response.output_item.added", {
                                     "type": "response.output_item.added",
-                                    "output_index": state["output_index"],
-                                    "item": {
-                                        "type": "function_call",
-                                        "id": state["item_id"],
-                                        "call_id": tcid,
-                                        "name": state["name"],
-                                        "arguments": "",
-                                    },
+                                    "output_index": idx,
+                                    "item": {**item, "arguments": ""},
                                     "sequence_number": next_seq(),
                                 })
-                            if frag and state.get("output_index") is not None:
-                                yield _responses_event("response.function_call_arguments.delta", {
-                                    "type": "response.function_call_arguments.delta",
-                                    "item_id": state["item_id"],
-                                    "output_index": state["output_index"],
-                                    "delta": frag,
-                                    "sequence_number": next_seq(),
-                                })
-
-                    for ev in ensure_created():
-                        yield ev
-
-                    indexed = []
-                    if reason_started:
-                        reason_item = {
-                            "type": "reasoning",
-                            "id": reason_item_id,
-                            "summary": [{"type": "summary_text", "text": reason_acc}],
-                        }
-                        indexed.append((reason_index, reason_item))
-                        yield _responses_event("response.reasoning_summary_text.done", {
-                            "type": "response.reasoning_summary_text.done",
-                            "item_id": reason_item_id,
-                            "output_index": reason_index,
-                            "summary_index": 0,
-                            "text": reason_acc,
-                            "sequence_number": next_seq(),
-                        })
-                        yield _responses_event("response.reasoning_summary_part.done", {
-                            "type": "response.reasoning_summary_part.done",
-                            "item_id": reason_item_id,
-                            "output_index": reason_index,
-                            "summary_index": 0,
-                            "part": {"type": "summary_text", "text": reason_acc},
-                            "sequence_number": next_seq(),
-                        })
-                        yield _responses_event("response.output_item.done", {
-                            "type": "response.output_item.done",
-                            "output_index": reason_index,
-                            "item": reason_item,
-                            "sequence_number": next_seq(),
-                        })
-
-                    if text_started:
-                        text_item = {
-                            "type": "message",
-                            "id": text_item_id,
-                            "role": "assistant",
-                            "status": "completed",
-                            "content": [{"type": "output_text", "text": text_acc}],
-                        }
-                        indexed.append((text_index, text_item))
-                        yield _responses_event("response.output_text.done", {
-                            "type": "response.output_text.done",
-                            "item_id": text_item_id,
-                            "output_index": text_index,
-                            "content_index": 0,
-                            "text": text_acc,
-                            "sequence_number": next_seq(),
-                        })
-                        yield _responses_event("response.content_part.done", {
-                            "type": "response.content_part.done",
-                            "item_id": text_item_id,
-                            "output_index": text_index,
-                            "content_index": 0,
-                            "part": {"type": "output_text", "text": text_acc},
-                            "sequence_number": next_seq(),
-                        })
-                        yield _responses_event("response.output_item.done", {
-                            "type": "response.output_item.done",
-                            "output_index": text_index,
-                            "item": text_item,
-                            "sequence_number": next_seq(),
-                        })
-
-                    tool_names = []
-                    for tcid, state in sorted(tool_state.items(), key=lambda kv: kv[1]["index"]):
-                        name = state.get("name") or ""
-                        args = state.get("args") or "{}"
-                        if not name:
-                            continue
-                        tool_names.append(name)
-                        if state.get("output_index") is None:
-                            state["output_index"] = take_index()
-                        idx = state["output_index"]
-                        item = {
-                            "type": "function_call",
-                            "id": state["item_id"],
-                            "call_id": tcid,
-                            "name": name,
-                            "arguments": args,
-                        }
-                        indexed.append((idx, item))
-                        preview = args if len(args) < 200 else args[:200] + "…"
-                        log.info("tool call id=%s name=%s args=%s", tcid, name, preview)
-                        if not state.get("announced"):
-                            yield _responses_event("response.output_item.added", {
-                                "type": "response.output_item.added",
+                            yield _responses_event("response.function_call_arguments.done", {
+                                "type": "response.function_call_arguments.done",
+                                "item_id": state["item_id"],
                                 "output_index": idx,
-                                "item": {**item, "arguments": ""},
+                                "name": name,
+                                "arguments": args,
                                 "sequence_number": next_seq(),
                             })
-                        yield _responses_event("response.function_call_arguments.done", {
-                            "type": "response.function_call_arguments.done",
-                            "item_id": state["item_id"],
-                            "output_index": idx,
-                            "name": name,
-                            "arguments": args,
-                            "sequence_number": next_seq(),
-                        })
-                        yield _responses_event("response.output_item.done", {
-                            "type": "response.output_item.done",
-                            "output_index": idx,
-                            "item": item,
-                            "sequence_number": next_seq(),
-                        })
+                            yield _responses_event("response.output_item.done", {
+                                "type": "response.output_item.done",
+                                "output_index": idx,
+                                "item": item,
+                                "sequence_number": next_seq(),
+                            })
 
-                    items = [it for _, it in sorted(indexed, key=lambda p: p[0])]
-                    rid = rid or f"resp_{int(time.time())}"
-                    usage = responses_usage_from_mistral(raw_usage)
-                    log.info(
-                        "responses done conv=%s types=%s tools=%s reason=%s usage=%s think=%d raw_usage_keys=%s",
-                        rid, seen_types, tool_names, reason,
-                        f"{usage['input_tokens']}+{usage['output_tokens']}={usage['total_tokens']}"
-                        f" cache={usage['input_tokens_details'].get('cached_tokens', 0)}",
-                        len(reason_acc),
-                        sorted((raw_usage or {}).keys()),
+                        items = [it for _, it in sorted(indexed, key=lambda p: p[0])]
+                        rid = rid or f"resp_{int(time.time())}"
+                        usage = responses_usage_from_mistral(raw_usage)
+                        log.info(
+                            "responses done conv=%s types=%s tools=%s reason=%s usage=%s think=%d raw_usage_keys=%s",
+                            rid, seen_types, tool_names, reason,
+                            f"{usage['input_tokens']}+{usage['output_tokens']}={usage['total_tokens']}"
+                            f" cache={usage['input_tokens_details'].get('cached_tokens', 0)}",
+                            len(reason_acc),
+                            sorted((raw_usage or {}).keys()),
+                        )
+                        terminal = True
+                        if entries and rid:
+                            cache_conversation(
+                                rid, entries, function_call_entries_from_tool_state(tool_state),
+                            )
+                        yield _responses_event("response.completed", {
+                            "type": "response.completed",
+                            "response": response_obj("completed", items, usage),
+                        })
+                        return
+                except aiohttp.ClientError as e:
+                    last_err = e
+                    log.error(
+                        "connection error: %s (reason=%s attempt=%d/%d opened=%s)",
+                        e, reason, attempt, tries, opened,
                     )
-                    terminal = True
-                    yield _responses_event("response.completed", {
-                        "type": "response.completed",
-                        "response": response_obj("completed", items, usage),
-                    })
-                    return
-        except aiohttp.ClientError as e:
-            log.error("connection error: %s", e)
-            if not terminal:
-                terminal = True
-                yield failed(str(e))
+                    if opened or not is_transient_upstream(e) or attempt >= tries:
+                        if not terminal:
+                            terminal = True
+                            yield failed(str(e))
+                        return
+                    log.warning(
+                        "retry %s after disconnect in %ss",
+                        reason, CREATE_RETRY_BACKOFF * attempt,
+                    )
+                    await asyncio.sleep(CREATE_RETRY_BACKOFF * attempt)
         if not terminal:
-            yield failed("upstream stream ended without a terminal event")
+            yield failed(
+                str(last_err) if last_err else "upstream stream ended without a terminal event"
+            )
 
 
 def error_response(status: int, message: str, code: str = "upstream_error") -> Response:
@@ -1713,7 +1977,7 @@ async def responses(request: Request):
 
     model = resolve_model(body.get("model"))
     try:
-        payload = responses_to_mistral(body)
+        payload, entries = responses_to_mistral(body)
     except Exception as e:
         return error_response(422, f"Payload translation error: {e}", "invalid_payload")
 
@@ -1722,6 +1986,19 @@ async def responses(request: Request):
         return error_response(401, "Missing API key (client Authorization or MISTRAL_KEY)", "missing_api_key")
 
     prev = extract_previous_id(body, request)
+
+    append_payload = None
+    if not prev:
+        match = find_append_match(entries)
+        if match:
+            prev = match[0]
+            append_payload = strip_for_append(payload)
+            append_payload["inputs"] = match[1]
+            log.info(
+                "append match conv=%s new_entries=%d total_entries=%d kinds=%s",
+                prev, len(match[1]), len(entries), input_kinds(match[1]),
+            )
+
     raw_in = body.get("input")
     raw_kinds = []
     if isinstance(raw_in, list):
@@ -1752,15 +2029,17 @@ async def responses(request: Request):
 
     if body.get("stream"):
         payload["stream"] = True
+        if append_payload:
+            append_payload["stream"] = True
         return StreamingResponse(
-            stream_responses(upstream_key, model, payload, prev),
+            stream_responses(upstream_key, model, payload, prev, entries, append_payload),
             media_type="text/event-stream",
             headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
         )
 
     async with aiohttp.ClientSession() as session:
         try:
-            resp, reason, err_text = await post_conversation(session, upstream_key, payload, prev)
+            resp, reason, err_text = await post_conversation(session, upstream_key, payload, prev, append_payload)
             try:
                 if resp.status != 200:
                     return error_response(
@@ -1778,6 +2057,7 @@ async def responses(request: Request):
             return error_response(502, "Bad upstream response")
 
     translated = mistral_to_responses(data, model)
+    cache_conversation(translated.get("id"), entries, function_call_entries_from_outputs(data))
     usage = translated.get("usage") or {}
     log.info(
         "responses done conv=%s reason=%s usage=%s raw_usage_keys=%s",
