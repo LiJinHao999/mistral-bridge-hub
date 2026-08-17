@@ -998,7 +998,7 @@ def merge_raw_usage(current: dict, incoming: dict) -> dict:
 
 
 def estimate_cached_tokens(prompt_tokens: int, previous_prompt_tokens: int) -> int:
-    """Estimate cache hits when Conversations omits prompt_tokens_details.
+    """Estimate cache read when Conversations omits prompt_tokens_details.
 
     An append's prompt is previous_prompt + this turn. The previous prompt
     is a conservative prefix. Official cache blocks are 64 tokens.
@@ -1008,10 +1008,28 @@ def estimate_cached_tokens(prompt_tokens: int, previous_prompt_tokens: int) -> i
     return min(prompt_tokens, previous_prompt_tokens) // CACHE_BLOCK_TOKENS * CACHE_BLOCK_TOKENS
 
 
+def estimate_cache_write_tokens(prompt_tokens: int, previous_prompt_tokens: int) -> int:
+    """Estimate cache write when Conversations omits cache_write_tokens.
+
+    On create (prev=0): the entire prompt is written to cache.
+    On append: the delta beyond the cached prefix is newly written.
+    """
+    if prompt_tokens < CACHE_BLOCK_TOKENS:
+        return 0
+    delta = prompt_tokens - min(prompt_tokens, previous_prompt_tokens)
+    if delta < CACHE_BLOCK_TOKENS:
+        return 0
+    return delta // CACHE_BLOCK_TOKENS * CACHE_BLOCK_TOKENS
+
+
 def cache_log_label(fields: dict) -> str:
-    """`cache=N` when upstream reported it; `cache~N` when locally estimated."""
-    mark = "~" if fields.get("cache_estimated") else "="
-    return f"cache{mark}{fields.get('cached', 0)}"
+    """`cache_read=N cache_write=M` (upstream) or `cache_read~N cache_write~M` (estimated)."""
+    rmark = "~" if fields.get("cache_estimated") else "="
+    wmark = "~" if fields.get("cache_write_estimated") else "="
+    parts = [f"cache_read{rmark}{fields.get('cached', 0)}"]
+    if fields.get("cache_write") or fields.get("cache_write_estimated"):
+        parts.append(f"cache_write{wmark}{fields.get('cache_write', 0)}")
+    return " ".join(parts)
 
 
 def mistral_usage_fields(usage, conv_id: str = None) -> dict:
@@ -1061,20 +1079,29 @@ def mistral_usage_fields(usage, conv_id: str = None) -> dict:
         or 0
     )
     cached = _as_int(cached)
+    cache_write = _as_int(cache_write)
     cache_estimated = False
+    cache_write_estimated = False
+    prev = _conv_prompt_tokens.get(conv_id, 0) if conv_id else 0
     if not cached and conv_id:
-        estimated = estimate_cached_tokens(prompt, _conv_prompt_tokens.get(conv_id, 0))
+        estimated = estimate_cached_tokens(prompt, prev)
         if estimated:
             cached = estimated
             cache_estimated = True
+    if not cache_write:
+        estimated_w = estimate_cache_write_tokens(prompt, prev)
+        if estimated_w:
+            cache_write = estimated_w
+            cache_write_estimated = True
     return {
         "prompt": prompt,
         "completion": completion,
         "total": total,
         "cached": cached,
-        "cache_write": _as_int(cache_write),
+        "cache_write": cache_write,
         "reasoning": _as_int(reasoning),
         "cache_estimated": cache_estimated,
+        "cache_write_estimated": cache_write_estimated,
     }
 
 
