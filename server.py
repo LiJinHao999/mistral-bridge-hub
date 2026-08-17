@@ -536,7 +536,7 @@ def find_append_match(entries: list):
             continue
         if _entries_hash(entries[:cached_len]) != prefix_hash:
             continue
-        new_entries = skip_replayed_function_calls(entries[cached_len:])
+        new_entries = prepare_append_entries(entries[cached_len:])
         if not new_entries:
             continue
         best = (conv_id, new_entries)
@@ -544,34 +544,36 @@ def find_append_match(entries: list):
     return best
 
 
-def skip_replayed_function_calls(entries: list) -> list:
-    """Drop function.call entries that this same batch later settles.
+def prepare_append_entries(entries: list) -> list:
+    """Keep only what Mistral can accept as the next append.
 
-    After a tool-call turn Mistral already has those calls as model output.
-    Re-appending them is 'other inputs' while results are still missing.
+    A conversation waiting on function.calls rejects anything except
+    function.result. Client replays often mix those results with the
+    previous assistant text / the function.call items themselves.
     """
-    settled_ids = {
-        item.get("tool_call_id")
-        for item in entries
-        if isinstance(item, dict)
-        and item.get("type") == "function.result"
-        and item.get("tool_call_id")
-    }
-    if not settled_ids:
+    if not entries:
         return entries
+    results = [
+        item for item in entries
+        if isinstance(item, dict) and item.get("type") == "function.result"
+    ]
+    if results:
+        dropped = len(entries) - len(results)
+        if dropped:
+            log.info(
+                "append keep results only results=%d dropped=%d kinds=%s",
+                len(results), dropped, input_kinds(entries),
+            )
+        return results
     kept = []
-    skipped = 0
+    skipped_calls = 0
     for item in entries:
-        if (
-            isinstance(item, dict)
-            and item.get("type") == "function.call"
-            and item.get("tool_call_id") in settled_ids
-        ):
-            skipped += 1
+        if isinstance(item, dict) and item.get("type") == "function.call":
+            skipped_calls += 1
             continue
         kept.append(item)
-    if skipped:
-        log.info("append skip replayed calls=%d remaining=%d", skipped, len(kept))
+    if skipped_calls:
+        log.info("append skip lone calls=%d remaining=%d", skipped_calls, len(kept))
     return kept
 
 
@@ -622,7 +624,7 @@ def cache_conversation(conv_id: str, entries: list, extra_entries: list = None):
     """Remember the client request now stored on this conversation.
 
     extra_entries is ignored: reconstructed model function.calls rarely hash
-    equal to the client's replay, and skip_replayed_function_calls already
+    equal to the client's replay, and prepare_append_entries already
     strips those calls from the next append.
     """
     if not conv_id or conv_id.startswith("resp_"):
@@ -1985,19 +1987,22 @@ async def responses(request: Request):
     if not upstream_key:
         return error_response(401, "Missing API key (client Authorization or MISTRAL_KEY)", "missing_api_key")
 
-    prev = extract_previous_id(body, request)
-
+    client_prev = extract_previous_id(body, request)
+    prev = None
     append_payload = None
-    if not prev:
-        match = find_append_match(entries)
-        if match:
-            prev = match[0]
-            append_payload = strip_for_append(payload)
-            append_payload["inputs"] = match[1]
-            log.info(
-                "append match conv=%s new_entries=%d total_entries=%d kinds=%s",
-                prev, len(match[1]), len(entries), input_kinds(match[1]),
-            )
+    match = find_append_match(entries)
+    if match:
+        prev = match[0]
+        append_payload = strip_for_append(payload)
+        append_payload["inputs"] = match[1]
+        log.info(
+            "append match conv=%s new_entries=%d total_entries=%d kinds=%s client_prev=%s",
+            prev, len(match[1]), len(entries), input_kinds(match[1]), client_prev,
+        )
+    elif client_prev:
+        # Have an id but no prefix we can slice. Appending the full window
+        # while tools are pending is a 400; create instead.
+        log.info("append skip unsliced client_prev=%s → create", client_prev)
 
     raw_in = body.get("input")
     raw_kinds = []
