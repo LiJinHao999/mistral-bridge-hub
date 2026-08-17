@@ -101,6 +101,51 @@ def _as_json_string(value) -> str:
         return str(value)
 
 
+def _json_args_complete(args: str) -> bool:
+    """True when a tool call's arguments blob is whole enough to hand over."""
+    text = (args or "").strip()
+    if not text:
+        return True
+    try:
+        json.loads(text)
+    except (TypeError, ValueError):
+        return False
+    return True
+
+
+def sanitize_tool_args(args, tcid: str = "", name: str = ""):
+    """Normalize tool arguments to something that always parses as JSON.
+
+    Mistral stores `arguments` on the conversation forever and replays it to the
+    model gateway on every later append. A blob the gateway cannot json.loads is
+    a permanent 400 on that conversation (see `upstream_history_corrupt`), so
+    nothing malformed may be sent upstream.
+    """
+    # dicts / lists are structurally valid already, and Mistral accepts them.
+    if isinstance(args, (dict, list)):
+        return args
+    text = _as_json_string(args).strip() or "{}"
+    if _json_args_complete(text):
+        # Claude Code wraps arguments it could not parse itself. Unwrap it when
+        # the raw blob is usable after all, so the model sees real arguments
+        # instead of the wrapper.
+        try:
+            obj = json.loads(text)
+        except (TypeError, ValueError):
+            obj = None
+        if isinstance(obj, dict) and "__unparsedToolInput" in obj:
+            wrapper = obj.get("__unparsedToolInput")
+            raw = wrapper.get("raw") if isinstance(wrapper, dict) else wrapper
+            if isinstance(raw, str) and raw.strip() and _json_args_complete(raw):
+                return raw.strip()
+        return text
+    log.warning(
+        "tool args not valid JSON, replaced id=%s name=%s len=%d preview=%r",
+        tcid or "?", name or "?", len(text), text[:200],
+    )
+    return json.dumps({"__truncated__": "arguments were cut off upstream"})
+
+
 def content_to_text(content) -> str:
     """Flatten OpenAI / Anthropic content (str | list | dict | null) to text."""
     if content is None:
@@ -195,13 +240,12 @@ def emit_function_call(name, tcid, args, call_names=None):
     """Build a Mistral function.call entry and log it. None if name is empty."""
     if not name:
         return None
-    if args is None:
-        args = "{}"
-    elif not isinstance(args, (str, dict)):
-        args = _as_json_string(args)
     tcid = str(tcid or f"call_{name}")
     if isinstance(call_names, dict):
         call_names[tcid] = name
+    # Never let a malformed blob reach the conversation: it would be replayed
+    # to the gateway on every later append and 400 the thread for good.
+    args = sanitize_tool_args(args, tcid, name)
     arg_preview = args if isinstance(args, str) else _as_json_string(args)
     log.info(
         "tool call in name=%s id=%s arg_len=%s preview=%r",
@@ -560,6 +604,12 @@ def mark_conversation_busy(conv_id: str, busy: bool):
     updated'. Skipping a busy conversation makes the racing turn create its own
     instead of burning four retries and then failing. The TTL means a client
     that disconnects before the generator runs cannot pin a conversation.
+
+    Releasing clears the flag outright rather than holding a cooldown. Mistral
+    may still be writing the thread for a moment, so the next sequential turn
+    can still draw a 409 — but that retries with backoff and keeps the prompt
+    cache, whereas blocking the match would force a create and drop the cache
+    for good. Never trade a recoverable error for an unrecoverable cost.
     """
     rec = _conv_cache.get(conv_id)
     if not rec:
@@ -714,10 +764,37 @@ def missing_conversation(status: int, text: str) -> bool:
     return "was not found" in lowered or "conversation with id" in lowered
 
 
+def upstream_history_corrupt(status: int, text: str) -> bool:
+    """True when the stored conversation can no longer be replayed at all.
+
+    A tool call whose arguments were cut mid-string stays on the Mistral
+    conversation forever. Every later append replays it to the model gateway,
+    which fails to json.loads it and answers 400 ThirdPartyException. Nothing
+    can repair the thread from here, so the only way out is to drop it and
+    create; otherwise every following turn 400s and the client sees an empty
+    stream.
+    """
+    if status != 400:
+        return False
+    lowered = (text or "").lower()
+    return any(marker in lowered for marker in (
+        "unterminated string",
+        "expecting value",
+        "expecting ',' delimiter",
+        "expecting ':' delimiter",
+        "expecting property name",
+        "invalid control character",
+        "invalid \\escape",
+        "extra data",
+    ))
+
+
 def append_state_mismatch(status: int, text: str) -> bool:
     """True when this conversation cannot accept the append payload."""
     if status != 400:
         return False
+    if upstream_history_corrupt(status, text):
+        return True
     lowered = (text or "").lower()
     return (
         "function results are still missing" in lowered
@@ -730,6 +807,13 @@ def append_state_mismatch(status: int, text: str) -> bool:
         or "unknown tool_call_ids" in lowered
         or "unknown tool_call_id" in lowered
     )
+
+
+def append_backoff(attempt: int) -> float:
+    """Exponential: Mistral can hold a conversation for several seconds after
+    our stream ends, and waiting is far cheaper than falling back to create,
+    which throws away the whole prompt cache."""
+    return APPEND_CONFLICT_BACKOFF * (2 ** (attempt - 1))
 
 
 def append_should_fallback(status: int, text: str) -> bool:
@@ -1278,18 +1362,6 @@ def _args_fragment(prev: str, incoming: str) -> str:
     return incoming
 
 
-def _json_args_complete(args: str) -> bool:
-    """True when a tool call's arguments blob is whole enough to hand over."""
-    text = (args or "").strip()
-    if not text:
-        return True
-    try:
-        json.loads(text)
-    except (TypeError, ValueError):
-        return False
-    return True
-
-
 def _sse_field(line: str):
     """Parse one SSE 'field: value' line. Returns (field, value) or None."""
     if not line or line.startswith(":"):
@@ -1433,9 +1505,9 @@ async def post_conversation(session, key: str, payload: dict, conv_id: str = Non
                     if attempt < tries:
                         log.info(
                             "append %s concurrent, retry in %ss",
-                            conv_id, APPEND_CONFLICT_BACKOFF * attempt,
+                            conv_id, append_backoff(attempt),
                         )
-                        await asyncio.sleep(APPEND_CONFLICT_BACKOFF * attempt)
+                        await asyncio.sleep(append_backoff(attempt))
                         continue
                     # Another turn owns this conversation. Creating costs a
                     # cache miss; returning the 409 costs the caller its turn.
@@ -1444,7 +1516,10 @@ async def post_conversation(session, key: str, payload: dict, conv_id: str = Non
                     resp.release()
                     break
                 if reason == "append" and append_should_fallback(resp.status, last_text):
-                    if append_state_mismatch(resp.status, last_text):
+                    if upstream_history_corrupt(resp.status, last_text):
+                        evict_conversation(conv_id)
+                        log.warning("append %s history corrupt → create", conv_id)
+                    elif append_state_mismatch(resp.status, last_text):
                         evict_conversation(conv_id)
                         log.info("append %s state mismatch → create", conv_id)
                     else:
@@ -1555,10 +1630,21 @@ async def stream_response(upstream_key: str, model: str, payload: dict):
                             state["name"] = name
 
                 ordered = sorted(tool_state.items(), key=lambda kv: kv[1]["index"])
+                dropped = []
                 for tcid, state in ordered:
                     name = state.get("name") or ""
                     args = state.get("args") or "{}"
                     if not name:
+                        continue
+                    # A token limit truncates arguments without any error event.
+                    # Handing the client half-written JSON is worse than dropping
+                    # the call: a cut heredoc or patch gets executed as-is.
+                    if not _json_args_complete(args):
+                        log.warning(
+                            "drop truncated tool call id=%s name=%s len=%d",
+                            tcid, name, len(args),
+                        )
+                        dropped.append(name)
                         continue
                     saw_tool_call = True
                     tool_names.append(name)
@@ -1572,6 +1658,16 @@ async def stream_response(upstream_key: str, model: str, payload: dict):
                             "function": {"name": name, "arguments": args},
                         }]
                     })
+
+                if dropped:
+                    # Keep the turn non-empty and tell the model why, so the
+                    # caller's loop can correct instead of replaying the turn.
+                    note = (
+                        "[bridge] Dropped truncated tool call(s): %s. The arguments were "
+                        "cut off by the upstream token limit, so the call was never valid "
+                        "JSON. Retry in smaller chunks." % ", ".join(dropped)
+                    )
+                    yield emit({"content": ("\n\n" + note) if text_acc else note})
 
                 if not sent_role:
                     yield emit({"content": ""})
@@ -1684,6 +1780,49 @@ async def stream_responses(upstream_key: str, model: str, payload: dict, conv_id
             obj["usage"] = usage
         return obj
 
+    def emit_text_note(note: str):
+        """Add a bridge note to the assistant text, opening the item if needed.
+
+        A turn whose only output was a dropped tool call would otherwise stream
+        nothing, and the client reads a zero-output turn as an empty response
+        and retries it. The note also tells the model what went wrong, so the
+        agent loop can correct itself instead of repeating the same call.
+        """
+        nonlocal text_started, text_index, text_acc
+        chunk = note if not text_acc or text_acc.endswith("\n") else "\n\n" + note
+        text_acc += chunk
+        if not text_started:
+            text_started = True
+            text_index = take_index()
+            yield _responses_event("response.output_item.added", {
+                "type": "response.output_item.added",
+                "output_index": text_index,
+                "item": {
+                    "type": "message",
+                    "id": text_item_id,
+                    "role": "assistant",
+                    "status": "in_progress",
+                    "content": [{"type": "output_text", "text": ""}],
+                },
+                "sequence_number": next_seq(),
+            })
+            yield _responses_event("response.content_part.added", {
+                "type": "response.content_part.added",
+                "item_id": text_item_id,
+                "output_index": text_index,
+                "content_index": 0,
+                "part": {"type": "output_text", "text": ""},
+                "sequence_number": next_seq(),
+            })
+        yield _responses_event("response.output_text.delta", {
+            "type": "response.output_text.delta",
+            "item_id": text_item_id,
+            "output_index": text_index,
+            "content_index": 0,
+            "delta": chunk,
+            "sequence_number": next_seq(),
+        })
+
     def ensure_created():
         nonlocal created_sent
         if created_sent:
@@ -1706,6 +1845,26 @@ async def stream_responses(upstream_key: str, model: str, payload: dict, conv_id
         nonlocal rid, terminal
         for ev in ensure_created():
             yield ev
+
+        # A cut stream leaves the last arguments blob half written. Upstream has
+        # already stored it on this conversation, and replays it to the gateway
+        # on every later append as a permanent 400, so the thread is burnt:
+        # drop the call, say why, and never append here again. This holds even
+        # when the stream ended cleanly — a token limit truncates arguments
+        # without any error event.
+        truncated = [
+            state.get("name")
+            for _, state in sorted(tool_state.items(), key=lambda kv: kv[1]["index"])
+            if state.get("name") and not _json_args_complete(state.get("args") or "{}")
+        ]
+        if truncated:
+            evict_conversation(rid)
+            for ev in emit_text_note(
+                "[bridge] Dropped truncated tool call(s): %s. The arguments were cut "
+                "off by the upstream token limit, so the call was never valid JSON. "
+                "Retry in smaller chunks." % ", ".join(truncated)
+            ):
+                yield ev
 
         indexed = []
         if reason_started:
@@ -1776,10 +1935,14 @@ async def stream_responses(upstream_key: str, model: str, payload: dict, conv_id
             args = state.get("args") or "{}"
             if not name:
                 continue
-            # A cut stream leaves the last arguments blob half written. Handing
-            # the client truncated JSON is worse than dropping the call.
-            if partial and not _json_args_complete(args):
-                log.warning("drop truncated tool call id=%s name=%s len=%d", tcid, name, len(args))
+            # Handing the client truncated JSON is worse than dropping the call:
+            # a half-written heredoc or patch is executed as-is. Already
+            # reported and evicted above.
+            if not _json_args_complete(args):
+                log.warning(
+                    "drop truncated tool call id=%s name=%s len=%d partial=%s",
+                    tcid, name, len(args), partial,
+                )
                 continue
             tool_names.append(name)
             if state.get("output_index") is None:
@@ -1838,7 +2001,9 @@ async def stream_responses(upstream_key: str, model: str, payload: dict, conv_id
             if not items:
                 yield failed("upstream stream ended before any output")
                 return
-        elif entries and rid:
+        elif entries and rid and not truncated:
+            # `truncated` was evicted above — caching it back would hand the
+            # next turn the same poisoned conversation.
             cache_conversation(
                 rid,
                 entries,
@@ -1875,9 +2040,9 @@ async def stream_responses(upstream_key: str, model: str, payload: dict, conv_id
                                     if attempt < tries:
                                         log.info(
                                             "append %s concurrent, retry in %ss",
-                                            conv_id, APPEND_CONFLICT_BACKOFF * attempt,
+                                            conv_id, append_backoff(attempt),
                                         )
-                                        await asyncio.sleep(APPEND_CONFLICT_BACKOFF * attempt)
+                                        await asyncio.sleep(append_backoff(attempt))
                                         continue
                                     # Another turn owns this conversation. Creating
                                     # costs a cache miss; failing costs the agent.
@@ -1885,7 +2050,10 @@ async def stream_responses(upstream_key: str, model: str, payload: dict, conv_id
                                     evict_conversation(conv_id)
                                     break
                                 if reason == "append" and append_should_fallback(resp.status, last_text):
-                                    if append_state_mismatch(resp.status, last_text):
+                                    if upstream_history_corrupt(resp.status, last_text):
+                                        evict_conversation(conv_id)
+                                        log.warning("append %s history corrupt → create", conv_id)
+                                    elif append_state_mismatch(resp.status, last_text):
                                         evict_conversation(conv_id)
                                         log.info("append %s state mismatch → create", conv_id)
                                     else:
