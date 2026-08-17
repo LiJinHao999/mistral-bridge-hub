@@ -25,3 +25,5 @@ Thumbs.db
 # Git
 *.orig
 *.rej
+# Runtime pidfile
+.bridge.pid
