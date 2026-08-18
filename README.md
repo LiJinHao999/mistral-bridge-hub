@@ -2,128 +2,124 @@
 
 <img src="assets/logo.png" alt="Mistral GLM Bridge logo" width="120"/>
 
-# 🌉 Mistral GLM Bridge
+# Mistral GLM Bridge
 
-**OpenAI-compatible → Mistral `/v1/conversations` proxy for 9router**
+**OpenAI-compatible API → Mistral `/v1/conversations`**
+
+[English](README.md) · [中文](README.zh.md)
 
 [![License](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 [![Python](https://img.shields.io/badge/python-3.9%2B-blue.svg)](https://www.python.org/)
 [![FastAPI](https://img.shields.io/badge/built%20with-FastAPI-009688.svg)](https://fastapi.tiangolo.com/)
-[![Platform](https://img.shields.io/badge/platform-linux%20%7C%20macOS-lightgrey.svg)](https://github.com/)
-[![PRs Welcome](https://img.shields.io/badge/PRs-welcome-brightgreen.svg)](https://github.com/)
-[![Release](https://img.shields.io/github/v/release/0xgetz/mistral-bridge.svg)](https://github.com/0xgetz/mistral-bridge/releases)
 
 </div>
 
----
+Fork of [0xgetz/mistral-bridge](https://github.com/0xgetz/mistral-bridge). This repo is a local OpenAI-compatible proxy so Cursor, Claude Code, and similar clients can talk to Mistral-hosted models (default `glm-5-2`) without using Mistral’s rate-limited Chat Completions endpoint.
 
-## 🌍 README Languages
+## Why
 
-| 🌐 | Language | |
-|----|----------|---|
-| 🇬🇧 | **English** | [Read](README.md) |
-| 🇮🇩 | **Bahasa Indonesia** | [Baca](README.id.md) |
-| 🇨🇳 | **中文** | [阅读](README.zh.md) |
-| 🇯🇵 | **日本語** | [読む](README.ja.md) |
-| 🇰🇷 | **한국어** | [읽기](README.ko.md) |
+Mistral exposes two APIs:
 
----
+| Endpoint | Format | Notes |
+|---|---|---|
+| `/v1/chat/completions` | OpenAI Chat Completions | Third-party models often hit **429** |
+| `/v1/conversations` | Mistral-native threads | Create + append, no Chat Completions quota |
 
-## 📌 Overview
+This bridge accepts OpenAI-shaped requests, forwards them as Conversations, and translates the stream/JSON back.
 
-Mistral has **two different endpoints**:
+## Endpoints
 
-- `/v1/chat/completions` (OpenAI-compatible) — **often rate-limited (429)** for third-party models
-- `/v1/conversations` (Mistral-native) — **no rate limit**, smooth
+| Method | Path | Behavior |
+|---|---|---|
+| `POST` | `/v1/chat/completions` | Stateless. Always **creates** a new conversation from the full `messages` window. |
+| `POST` | `/v1/responses` | Stateful. Matches a previous thread and **appends** when it can; otherwise creates. `response.id` is the Mistral `conversation_id`. |
+| `GET` | `/v1/models` | Passthrough to Mistral; falls back to the configured local model. |
+| `GET` | `/v1/models/{id}` | Same, for a single model card. |
+| `GET` | `/health` | `{status, model, port}` |
 
-**9router** needs the OpenAI-compatible format. This bridge:
+Auth: client `Authorization: Bearer …` wins; otherwise `MISTRAL_KEY`.
 
-1. Receives OpenAI-format requests from 9router
-2. Translates them to `/v1/conversations`
-3. Translates the response back to OpenAI format
-4. Returns via local port (default `8090`)
+Streaming (`"stream": true`) is supported on both Chat Completions and Responses.
 
-Result: **GLM-5.2 via Mistral without 429**, plugged in as a regular 9router provider.
-
-## 🚀 Quick Start
+## Quick start
 
 ```bash
-git clone https://github.com/0xgetz/mistral-bridge.git
-cd mistral-bridge
-pip install -r requirements.txt
+git clone https://github.com/LiJinHao999/mistral-bridge-hub.git
+cd mistral-bridge-hub
+python3 -m venv .venv
+.venv/bin/pip install -r requirements.txt
 
-# Setup API key (no default — DO NOT commit your key)
 echo "MISTRAL_KEY=sk-..." > .env
+set -a; . ./.env; set +a
 
-# Start bridge + ensure 9router node
 ./mistral-bridge.sh start
 ```
 
-## 🛠 Commands
+Default listen address is `0.0.0.0:8577`.
 
 ```bash
-./mistral-bridge.sh start     # start bridge + ensure 9router node
-./mistral-bridge.sh stop      # stop bridge
-./mistral-bridge.sh status    # check bridge + node status
-./mistral-bridge.sh watch     # watchdog: auto-restart on crash
-```
-
-## 📁 Structure
-
-```
-mistral-bridge/
-├── server.py              # FastAPI bridge server
-├── mistral-bridge.sh      # control script (start/stop/status/watch)
-├── assets/                # logo (SVG + PNG)
-├── requirements.txt       # dependencies
-├── LICENSE                # MIT
-└── README.md              # this file (+ .id/.zh/.ja/.ko translations)
-```
-
-## 🔧 Test
-
-```bash
-# Direct bridge test
-curl http://127.0.0.1:8090/v1/chat/completions \
+curl http://127.0.0.1:8577/v1/chat/completions \
+  -H "Authorization: Bearer $MISTRAL_KEY" \
   -H "Content-Type: application/json" \
-  -d '{"model":"glm-5-2","messages":[{"role":"user","content":"halo"}],"max_tokens":50}'
+  -d '{"model":"glm-5-2","messages":[{"role":"user","content":"hello"}],"max_tokens":50}'
 
-# Via 9router
-curl http://127.0.0.1:20128/v1/chat/completions \
-  -H "Authorization: Bearer <9router-key>" \
+curl http://127.0.0.1:8577/v1/responses \
+  -H "Authorization: Bearer $MISTRAL_KEY" \
   -H "Content-Type: application/json" \
-  -d '{"model":"openai-compatible-chat-xxxx/glm-5-2","messages":[{"role":"user","content":"halo"}],"max_tokens":50}'
-
-# Responses API (conversation_id is returned as response.id)
-curl http://127.0.0.1:8090/v1/responses \
-  -H "Content-Type: application/json" \
-  -d '{"model":"glm-5-2","input":"halo","max_output_tokens":50}'
+  -d '{"model":"glm-5-2","input":"hello","max_output_tokens":50}'
 ```
 
-## 📦 Environment Variables
+Point any OpenAI-compatible client at `http://127.0.0.1:8577/v1` with the same key.
+
+## Environment
 
 | Var | Default | Description |
-|-----|---------|-------------|
-| `MISTRAL_KEY` | *(required)* | Mistral API key |
-| `BRIDGE_MODEL` | `glm-5-2` | Model to forward |
-| `BRIDGE_PORT` | `8090` | Local listen port |
-| `BRIDGE_HOST` | `0.0.0.0` | Listen address |
+|---|---|---|
+| `MISTRAL_KEY` | *(none)* | Fallback API key if the client does not send `Authorization` |
+| `BRIDGE_MODEL` | `glm-5-2` | Default model when the client omits one |
+| `BRIDGE_PORT` | `8577` | Listen port |
+| `BRIDGE_HOST` | `0.0.0.0` | Listen host |
 
-## 🔄 Auto-start on reboot
+`./mistral-bridge.sh` reads `.env` and is the Linux control script:
+
+```bash
+./mistral-bridge.sh start      # background start
+./mistral-bridge.sh stop
+./mistral-bridge.sh restart
+./mistral-bridge.sh status
+./mistral-bridge.sh enable     # systemd user unit, starts on login
+./mistral-bridge.sh disable
+```
+
+On a headless box, after `enable` also run `sudo loginctl enable-linger $USER` so the unit survives reboot without a login. Without systemd:
 
 ```bash
 crontab -e
-# add:
-@reboot /root/mistral-bridge/mistral-bridge.sh start
+# @reboot /path/to/mistral-bridge/mistral-bridge.sh start
 ```
 
-## 🤝 Contributing
+## Layout
 
-PRs welcome! Please follow:
-- Keep it simple (KISS)
-- No secrets in code — always use env vars
-- Test before submitting
+```
+mistral-bridge/
+├── server.py              # uvicorn entry
+├── bridge/
+│   ├── config.py          # env, timeouts, logger
+│   ├── utils.py           # keys, content flattening, error helper
+│   ├── models.py          # local /v1/models fallback
+│   ├── tools.py           # function.call / function.result
+│   ├── cache.py           # create vs append matching
+│   ├── translate.py       # Chat / Responses ↔ Conversations
+│   ├── sse.py             # Mistral SSE parser
+│   ├── upstream.py        # create / append / GET
+│   ├── streaming.py       # SSE → OpenAI events
+│   ├── routes.py          # HTTP routes
+│   └── app.py             # FastAPI app
+├── mistral-bridge.sh      # start/stop/restart/status/enable
+├── requirements.txt
+└── LICENSE
+```
 
-## 📄 License
+## License
 
-[MIT](LICENSE) © 2026 [0xgetz](https://github.com/0xgetz)
+[MIT](LICENSE). Upstream copyright: 0xgetz.

@@ -2,122 +2,124 @@
 
 <img src="assets/logo.png" alt="Mistral GLM Bridge 标志" width="120"/>
 
-# 🌉 Mistral GLM Bridge
+# Mistral GLM Bridge
 
-**OpenAI 兼容 → Mistral `/v1/conversations` 代理 (for 9router)**
+**OpenAI 兼容 API → Mistral `/v1/conversations`**
+
+[English](README.md) · [中文](README.zh.md)
 
 [![License](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 [![Python](https://img.shields.io/badge/python-3.9%2B-blue.svg)](https://www.python.org/)
 [![FastAPI](https://img.shields.io/badge/built%20with-FastAPI-009688.svg)](https://fastapi.tiangolo.com/)
-[![Platform](https://img.shields.io/badge/platform-linux%20%7C%20macOS-lightgrey.svg)](https://github.com/)
-[![PRs Welcome](https://img.shields.io/badge/PRs-welcome-brightgreen.svg)](https://github.com/)
 
 </div>
 
----
+基于 [0xgetz/mistral-bridge](https://github.com/0xgetz/mistral-bridge) 的 fork。这是一个本地 OpenAI 兼容代理，让 Cursor、Claude Code 等客户端可以直接打 Mistral 上的模型（默认 `glm-5-2`），而不走 Mistral 经常 429 的 Chat Completions。
 
-## 🌍 README 语言
+## 为什么需要桥
 
-| 🌐 | 语言 | |
-|----|------|---|
-| 🇬🇧 | **English** | [阅读](README.md) |
-| 🇮🇩 | **Bahasa Indonesia** | [Baca](README.id.md) |
-| 🇨🇳 | **中文** | [阅读](README.zh.md) |
-| 🇯🇵 | **日本語** | [読む](README.ja.md) |
-| 🇰🇷 | **한국어** | [읽기](README.ko.md) |
+Mistral 有两套接口：
 
----
+| 端点 | 格式 | 说明 |
+|---|---|---|
+| `/v1/chat/completions` | OpenAI Chat Completions | 第三方模型经常 **429** |
+| `/v1/conversations` | Mistral 原生线程 | create + append，不受 Chat Completions 配额限制 |
 
-## 📌 简介
+本桥接收 OpenAI 形态的请求，转成 Conversations 再把流/JSON 翻译回去。
 
-Mistral 有**两个不同的端点**：
+## 接口
 
-- `/v1/chat/completions`（OpenAI 兼容）— 第三方模型**经常被限流 (429)**
-- `/v1/conversations`（Mistral 原生）— **无限流**，流畅
+| 方法 | 路径 | 行为 |
+|---|---|---|
+| `POST` | `/v1/chat/completions` | 无状态。始终用完整 `messages` **新建**会话。 |
+| `POST` | `/v1/responses` | 有状态。能匹配到上一轮就 **append**，否则 create。`response.id` 即 Mistral `conversation_id`。 |
+| `GET` | `/v1/models` | 透传到 Mistral；失败则回退到本地配置的模型。 |
+| `GET` | `/v1/models/{id}` | 同上，单条模型卡片。 |
+| `GET` | `/health` | `{status, model, port}` |
 
-**9router** 需要 OpenAI 兼容格式。此桥接器：
+鉴权：客户端 `Authorization: Bearer …` 优先，否则用 `MISTRAL_KEY`。
 
-1. 接收来自 9router 的 OpenAI 格式请求
-2. 翻译为 `/v1/conversations`
-3. 将响应翻译回 OpenAI 格式
-4. 通过本地端口返回（默认 `8090`）
+Chat Completions 和 Responses 都支持 `"stream": true`。
 
-结果：**GLM-5.2 通过 Mistral 无 429**，作为常规 9router 提供商接入。
-
-## 🚀 快速开始
+## 快速开始
 
 ```bash
-git clone https://github.com/0xgetz/mistral-bridge.git
-cd mistral-bridge
-pip install -r requirements.txt
+git clone https://github.com/LiJinHao999/mistral-bridge-hub.git
+cd mistral-bridge-hub
+python3 -m venv .venv
+.venv/bin/pip install -r requirements.txt
 
-# 设置 API 密钥（无默认值 — 不要提交密钥）
 echo "MISTRAL_KEY=sk-..." > .env
+set -a; . ./.env; set +a
 
-# 启动桥接 + 确保 9router 节点
 ./mistral-bridge.sh start
 ```
 
-## 🛠 命令
+默认监听 `0.0.0.0:8577`。
 
 ```bash
-./mistral-bridge.sh start     # 启动桥接 + 确保 9router 节点
-./mistral-bridge.sh stop      # 停止桥接
-./mistral-bridge.sh status    # 检查桥接 + 节点状态
-./mistral-bridge.sh watch     # 看门狗：崩溃时自动重启
-```
-
-## 📁 结构
-
-```
-mistral-bridge/
-├── server.py              # FastAPI 桥接服务器
-├── mistral-bridge.sh      # 控制脚本 (start/stop/status/watch)
-├── assets/                # 标志 (SVG + PNG)
-├── requirements.txt       # 依赖
-├── LICENSE                # MIT
-└── README.md              # 本文件 (+ .id/.zh/.ja/.ko 翻译)
-```
-
-## 🔧 测试
-
-```bash
-# 直接测试桥接
-curl http://127.0.0.1:8090/v1/chat/completions \
+curl http://127.0.0.1:8577/v1/chat/completions \
+  -H "Authorization: Bearer $MISTRAL_KEY" \
   -H "Content-Type: application/json" \
-  -d '{"model":"glm-5-2","messages":[{"role":"user","content":"halo"}],"max_tokens":50}'
+  -d '{"model":"glm-5-2","messages":[{"role":"user","content":"hello"}],"max_tokens":50}'
 
-# 通过 9router
-curl http://127.0.0.1:20128/v1/chat/completions \
-  -H "Authorization: Bearer <9router-key>" \
+curl http://127.0.0.1:8577/v1/responses \
+  -H "Authorization: Bearer $MISTRAL_KEY" \
   -H "Content-Type: application/json" \
-  -d '{"model":"openai-compatible-chat-xxxx/glm-5-2","messages":[{"role":"user","content":"halo"}],"max_tokens":50}'
+  -d '{"model":"glm-5-2","input":"hello","max_output_tokens":50}'
 ```
 
-## 📦 环境变量
+任意 OpenAI 兼容客户端把 base URL 指到 `http://127.0.0.1:8577/v1`，用同一把 key 即可。
 
-| 变量 | 默认值 | 说明 |
-|------|--------|------|
-| `MISTRAL_KEY` | *(必需)* | Mistral API 密钥 |
-| `BRIDGE_MODEL` | `glm-5-2` | 转发的模型 |
-| `BRIDGE_PORT` | `8090` | 本地监听端口 |
+## 环境变量
+
+| 变量 | 默认 | 说明 |
+|---|---|---|
+| `MISTRAL_KEY` | *(无)* | 客户端没带 `Authorization` 时的兜底 key |
+| `BRIDGE_MODEL` | `glm-5-2` | 客户端没指定模型时的默认值 |
+| `BRIDGE_PORT` | `8577` | 监听端口 |
 | `BRIDGE_HOST` | `0.0.0.0` | 监听地址 |
 
-## 🔄 重启自动启动
+`./mistral-bridge.sh` 会读 `.env`，用来在 Linux 上启停这个网关：
+
+```bash
+./mistral-bridge.sh start      # 后台启动
+./mistral-bridge.sh stop
+./mistral-bridge.sh restart
+./mistral-bridge.sh status
+./mistral-bridge.sh enable     # 安装 systemd 用户单元，登录后自动拉起
+./mistral-bridge.sh disable
+```
+
+无图形登录的机器，`enable` 之后再执行 `sudo loginctl enable-linger $USER`，重启才不会丢。没有 systemd 时：
 
 ```bash
 crontab -e
-# 添加:
-@reboot /root/mistral-bridge/mistral-bridge.sh start
+# @reboot /path/to/mistral-bridge/mistral-bridge.sh start
 ```
 
-## 🤝 贡献
+## 目录
 
-欢迎 PR！请遵循：
-- 保持简单 (KISS)
-- 代码中不留密钥 — 始终使用环境变量
-- 提交前先测试
+```
+mistral-bridge/
+├── server.py              # uvicorn 入口
+├── bridge/
+│   ├── config.py          # 环境变量、超时、日志
+│   ├── utils.py           # key、文本扁平化、错误响应
+│   ├── models.py          # 本地 /v1/models 回退
+│   ├── tools.py           # function.call / function.result
+│   ├── cache.py           # create vs append 匹配
+│   ├── translate.py       # Chat / Responses ↔ Conversations
+│   ├── sse.py             # Mistral SSE 解析
+│   ├── upstream.py        # create / append / GET
+│   ├── streaming.py       # SSE → OpenAI 事件
+│   ├── routes.py          # HTTP 路由
+│   └── app.py             # FastAPI 应用
+├── mistral-bridge.sh      # start/stop/restart/status/enable
+├── requirements.txt
+└── LICENSE
+```
 
-## 📄 许可证
+## 许可证
 
-[MIT](LICENSE) © 2026 [0xgetz](https://github.com/0xgetz)
+[MIT](LICENSE)。上游版权：0xgetz。
