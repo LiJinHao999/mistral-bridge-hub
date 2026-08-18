@@ -154,12 +154,21 @@ async def stream_response(session, resp, model: str, conv_id: str = None, entrie
                 "JSON. Retry in smaller chunks." % ", ".join(dropped)
             )
             yield emit({"content": ("\n\n" + note) if text_acc else note})
+            text_acc += note
 
-        if not saw_done and not text_acc.strip() and not saw_tool_call:
-            # Quiet EOF while still thinking: do not report a successful empty
-            # stop. The client has to see an error so it retries.
-            msg = "upstream stream ended before any visible output"
-            log.warning("chat stream cut with no visible output (think=%d) → error", len(think_acc))
+        if not text_acc.strip() and not saw_tool_call:
+            # Thinking already went out if it arrived; it cannot be un-sent.
+            # An empty successful stop would make the client keep that turn.
+            msg = (
+                "upstream produced no visible output"
+                if saw_done
+                else "upstream stream ended before any visible output"
+            )
+            log.warning(
+                "chat stream %s with no visible output (think=%d) → error",
+                "done" if saw_done else "cut",
+                len(think_acc),
+            )
             yield f"data: {json.dumps({'error': {'message': msg, 'type': 'upstream_error'}})}\n\n"
             yield "data: [DONE]\n\n"
             return
@@ -168,6 +177,13 @@ async def stream_response(session, resp, model: str, conv_id: str = None, entrie
         finish_reason = "tool_calls" if saw_tool_call else "stop"
         fields = mistral_usage_fields(raw_usage, conv_id)
         usage = chat_usage_from_fields(fields)
+        if entries and conv_id:
+            cache_conversation(
+                conv_id,
+                entries,
+                pending_call_ids_from_tool_state(tool_state),
+                prompt_tokens=usage.get("prompt_tokens") or 0,
+            )
         log.info(
             "stream done conv=%s types=%s chunks=%d finish=%s tools=%s usage=%s think=%d raw_usage_keys=%s",
             conv_id, seen_types, yielded, finish_reason, tool_names,
@@ -186,6 +202,8 @@ async def stream_response(session, resp, model: str, conv_id: str = None, entrie
     finally:
         resp.release()
         await session.close()
+        if conv_id:
+            mark_conversation_busy(conv_id, False)
 
 
 async def stream_responses(session, resp, reason, opener, model: str, conv_id: str = None, entries: list = None):
@@ -196,6 +214,13 @@ async def stream_responses(session, resp, reason, opener, model: str, conv_id: s
     here ends in response.completed or response.failed. A turn that already
     streamed content and then lost the socket is completed with what arrived —
     failing it mid-agent is what breaks the caller's loop.
+
+    This is a pass-through SSE proxy: once a delta is yielded it is on the
+    wire and cannot be taken back. A clean finish that thought and then
+    produced no text and no tool call therefore fails the turn. Completing
+    it with a bridge note would store junk in the transcript; retrying
+    upstream on the same stream would duplicate tokens the client already
+    saw. `response.failed` lets the caller retry a new request.
 
     `resp` is already open and answered 200. The caller runs the upstream
     request itself so it can still choose the HTTP status: Starlette sends the
@@ -253,6 +278,22 @@ async def stream_responses(session, resp, reason, opener, model: str, conv_id: s
                 state.get("name") and _json_args_complete(state.get("args") or "{}")
                 for state in tool_state.values()
             )
+        )
+
+    def incomplete_tool_names():
+        return [
+            state.get("name")
+            for _, state in sorted(tool_state.items(), key=lambda kv: kv[1]["index"])
+            if state.get("name") and not _json_args_complete(state.get("args") or "{}")
+        ]
+
+    def reasoning_only() -> bool:
+        """Clean finish with thinking and nothing the client can use."""
+        return bool(
+            reason_acc.strip()
+            and not text_acc.strip()
+            and not visible_output()
+            and not incomplete_tool_names()
         )
 
     def next_seq():
@@ -374,11 +415,7 @@ async def stream_responses(session, resp, reason, opener, model: str, conv_id: s
         # drop the call, say why, and never append here again. This holds even
         # when the stream ended cleanly — a token limit truncates arguments
         # without any error event.
-        truncated = [
-            state.get("name")
-            for _, state in sorted(tool_state.items(), key=lambda kv: kv[1]["index"])
-            if state.get("name") and not _json_args_complete(state.get("args") or "{}")
-        ]
+        truncated = incomplete_tool_names()
         if truncated:
             evict_conversation(rid)
             for ev in emit_text_note(
@@ -388,31 +425,19 @@ async def stream_responses(session, resp, reason, opener, model: str, conv_id: s
             ):
                 yield ev
 
-        # A reasoning item is not visible output: a turn carrying nothing else
-        # reaches the client as an empty response and it reports "no visible
-        # output". Say so instead, and do not promote the thinking to text —
-        # that text would be stored on the conversation and replayed on every
-        # later append, so a long ramble would cost tokens for the rest of the
-        # thread and invite the agent to act on half-formed reasoning.
-        surviving_tools = [
-            state for _, state in tool_state.items()
-            if state.get("name") and _json_args_complete(state.get("args") or "{}")
-        ]
-        if (
-            not partial
-            and not text_acc.strip()
-            and not surviving_tools
-            and reason_acc.strip()
-        ):
+        # Reasoning deltas are already on the wire; they cannot be discarded.
+        # Completing this as a successful turn (or stuffing a note into
+        # assistant text) would store junk the client then retries with.
+        # Fail so the caller starts a new request instead of appending here.
+        if not partial and reasoning_only():
             log.warning(
-                "turn produced only reasoning (%d chars) → note instead of empty turn",
+                "turn produced only reasoning (%d chars) → failed",
                 len(reason_acc),
             )
-            for ev in emit_text_note(
-                "[bridge] The model produced only reasoning this turn — no reply "
-                "text and no tool call. Ask again to get an actual answer."
-            ):
-                yield ev
+            evict_conversation(rid)
+            terminal = True
+            yield failed("upstream produced no visible output")
+            return
 
         indexed = []
         if reason_started:
@@ -792,14 +817,17 @@ async def stream_responses(session, resp, reason, opener, model: str, conv_id: s
 
 
 # ── Anthropic Messages stream ────────────────────────────────────────────────
-async def stream_anthropic(session, resp, model: str):
+async def stream_anthropic(session, resp, model: str, conv_id: str = None, entries: list = None):
     """SSE proxy: Mistral conversations stream -> Anthropic Messages events.
 
     ``resp`` is already open and answered 200 — the caller keeps the upstream
     request outside this generator so it can still return the real HTTP status
     (same reason as ``stream_response`` / ``stream_responses``).
+
+    `conv_id` is the matched conversation id (None for a create). `entries` is
+    the match-side entry list, used to cache the conversation state for the next
+    append.
     """
-    conv_id = None
     msg_started = False
     block_index = -1
     current_type = None  # "text" | "thinking"
@@ -1026,6 +1054,14 @@ async def stream_anthropic(session, resp, model: str):
         if fields["cached"]:
             final_usage["cache_read_input_tokens"] = fields["cached"]
 
+        if entries and conv_id:
+            cache_conversation(
+                conv_id,
+                entries,
+                pending_call_ids_from_tool_state(tool_state),
+                prompt_tokens=fields["prompt"] or 0,
+            )
+
         log.info(
             "anthropic stream done conv=%s types=%s finish=%s tools=%s usage=%s think=%d",
             conv_id, seen_types, stop_reason, tool_names,
@@ -1037,7 +1073,10 @@ async def stream_anthropic(session, resp, model: str):
         yield sse("message_delta", {
             "type": "message_delta",
             "delta": {"stop_reason": stop_reason, "stop_sequence": None},
-            "usage": {"output_tokens": final_usage["output_tokens"]},
+            "usage": {
+                "input_tokens": final_usage["input_tokens"],
+                "output_tokens": final_usage["output_tokens"],
+            },
         })
         yield sse("message_stop", {"type": "message_stop"})
         return
@@ -1054,4 +1093,6 @@ async def stream_anthropic(session, resp, model: str):
     finally:
         resp.release()
         await session.close()
+        if conv_id:
+            mark_conversation_busy(conv_id, False)
 

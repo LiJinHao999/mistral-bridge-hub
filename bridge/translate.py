@@ -83,7 +83,7 @@ def completion_args_from_body(body: dict) -> dict:
     if raw_max is None:
         raw_max = body.get("max_completion_tokens")
     if raw_max is None:
-        raw_max = 8192
+        raw_max = 131072
     args = {
         "temperature": temperature,
         "max_tokens": max(1, int(raw_max)),
