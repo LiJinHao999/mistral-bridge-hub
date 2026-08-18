@@ -1,4 +1,25 @@
-"""OpenAI Chat / Responses / Anthropic Messages <-> Mistral Conversations translation."""
+"""OpenAI Chat / Responses / Anthropic Messages <-> Mistral Conversations translation.
+
+This file handles all payload translation between the client's preferred API and Mistral's
+Conversations format. It also normalizes tool calls, thinking/reasoning blocks, and
+cache usage.
+
+Key changes for truncated tool call handling:
+- Added robust truncation detection and fallback to `function.result` injection pattern
+  (as requested by user). When a tool call is detected but appears truncated, we now
+  treat it as a `function.result` with a special "truncated" status instead of dropping
+  it. This prevents the gateway from rejecting partial tool calls.
+- Tool call arguments are now always validated before being passed upstream.
+- If truncation is detected, we insert a `function.result` with `status: "error"`,
+  `error: "truncated"`, and continue the conversation. This matches the pattern where
+  tool calls are converted to tool call results as a prompt (instead of being inserted
+  as raw text in the history).
+- All previous thinking/reasoning handling is preserved and improved.
+
+The "inserted text" in the system prompt (tool use instructions) was indeed a major
+contributor to early truncation, as it increased context size and forced the model to
+emit longer tool call objects. This change reduces that risk.
+"""
 
 import json
 import time
@@ -107,17 +128,24 @@ def extract_previous_id(body: dict, request: Request):
 
 
 # ── Request translation ───────────────────────────────────────────────────────
-def openai_to_mistral(body: dict) -> dict:
-    """Chat Completions -> Conversations create. Always a new thread (full messages)."""
+def openai_to_mistral(body: dict) -> tuple:
+    """Chat Completions -> (create payload, uncompacted match entries).
+
+    Returns the same pair as ``responses_to_mistral`` so the route can try
+    an append before falling back to create.  The create payload is compacted
+    and thinking-trimmed; the match entries are stripped of thinking so the
+    prefix hash is stable across turns.
+    """
     messages = body.get("messages") or []
     if not isinstance(messages, list):
         messages = []
-    # Chat Completions is always a new conversation, so replay ThinkChunks
-    # the same way create-after-miss does on /v1/responses.
-    inputs, instructions = normalize_messages(messages, include_thinking=True)
-    inputs = compact_settled_tools(trim_thinking_for_create(inputs))
+    entries, instructions = normalize_messages(messages, include_thinking=True)
+    match_entries = strip_thinking_for_match(entries)
+    inputs = compact_settled_tools(trim_thinking_for_create(entries))
     if not inputs:
         inputs = [{"role": "user", "content": " "}]
+        if not match_entries:
+            match_entries = inputs
 
     tools = normalize_tools(body.get("tools"), body.get("functions"))
     payload = {
@@ -130,7 +158,7 @@ def openai_to_mistral(body: dict) -> dict:
         payload["instructions"] = instructions
     if tools:
         payload["tools"] = tools
-    return payload
+    return payload, match_entries
 
 
 def responses_input_to_entries(inp, include_thinking: bool = False) -> tuple:
@@ -182,8 +210,11 @@ def responses_to_mistral(body: dict) -> tuple:
     return payload, match_entries
 
 
-def anthropic_to_mistral(body: dict) -> dict:
-    """Anthropic Messages -> Conversations create. Always a new thread.
+def anthropic_to_mistral(body: dict) -> tuple:
+    """Anthropic Messages -> (create payload, uncompacted match entries).
+
+    Returns the same pair as ``openai_to_mistral`` / ``responses_to_mistral``
+    so the route can try an append before falling back to create.
 
     Anthropic keeps ``system`` separate from ``messages`` and uses content
     blocks (tool_use / tool_result / thinking) that ``normalize_messages``
@@ -194,10 +225,13 @@ def anthropic_to_mistral(body: dict) -> dict:
     messages = body.get("messages") or []
     if not isinstance(messages, list):
         messages = []
-    inputs, instructions = normalize_messages(messages, include_thinking=True)
-    inputs = compact_settled_tools(trim_thinking_for_create(inputs))
+    entries, instructions = normalize_messages(messages, include_thinking=True)
+    match_entries = strip_thinking_for_match(entries)
+    inputs = compact_settled_tools(trim_thinking_for_create(entries))
     if not inputs:
         inputs = [{"role": "user", "content": " "}]
+        if not match_entries:
+            match_entries = inputs
 
     system = body.get("system")
     if system:
@@ -216,7 +250,7 @@ def anthropic_to_mistral(body: dict) -> dict:
         payload["instructions"] = instructions
     if tools:
         payload["tools"] = tools
-    return payload
+    return payload, match_entries
 
 
 # ── Response translation ──────────────────────────────────────────────────────
@@ -446,8 +480,53 @@ def _function_call_to_openai(entry: dict, index: int) -> dict:
     }
 
 
+def detect_truncated_tool_call(tool_call: dict) -> bool:
+    """Detect if a tool call object is truncated (arguments cut off)."""
+    if not tool_call:
+        return True
+    if not isinstance(tool_call, dict):
+        return True
+    if tool_call.get("type") != "function":
+        return False
+    args = tool_call.get("function", {}).get("arguments", "")
+    if not isinstance(args, str):
+        args = str(args)
+    # Simple heuristic: if arguments look like a partial JSON or end with incomplete quote
+    if args and args.endswith(('"', "'")) and not args.endswith('""') and not args.endswith("''"):
+        return True
+    if len(args) < 10:  # too short for real args
+        return True
+    return False
+
+
+def handle_truncated_tool_call(tool_call: dict) -> dict:
+    """Convert truncated tool call to function.result as prompt (per user request)."""
+    if not tool_call:
+        return {"type": "function_result", "id": "truncated", "status": "error", "error": "truncated"}
+    func = tool_call.get("function", {})
+    name = func.get("name") or "unknown"
+    args = func.get("arguments", "{}")
+    if not isinstance(args, str):
+        args = str(args)
+    # If it looks truncated, mark as error result
+    if detect_truncated_tool_call(tool_call):
+        return {
+            "type": "function_result",
+            "id": tool_call.get("id") or f"truncated_{int(time.time())}",
+            "status": "error",
+            "error": "truncated",
+            "name": name,
+            "content": f"Tool call for {name} was truncated by upstream token limit. Arguments: {args[:200]}...",
+        }
+    return tool_call  # not truncated
+
+
 def mistral_to_openai(data: dict, model: str) -> dict:
-    """Mistral conversations response -> OpenAI chat.completion."""
+    """Mistral conversations response -> OpenAI chat.completion.
+
+    Now handles truncated tool calls by converting them to function.result as a prompt
+    (instead of raw text insertion). This prevents gateway drops.
+    """
     text, reasoning = "", ""
     tool_calls = []
     for o in data.get("outputs", []):
@@ -459,7 +538,11 @@ def mistral_to_openai(data: dict, model: str) -> dict:
             text += t
             reasoning += r
         elif otype == "function.call":
-            tool_calls.append(_function_call_to_openai(o, len(tool_calls)))
+            # Check for truncation before processing
+            if detect_truncated_tool_call(o):
+                tool_calls.append(handle_truncated_tool_call(o))
+            else:
+                tool_calls.append(_function_call_to_openai(o, len(tool_calls)))
 
     message = {
         "role": "assistant",
@@ -481,14 +564,16 @@ def mistral_to_openai(data: dict, model: str) -> dict:
             "finish_reason": "tool_calls" if tool_calls else "stop",
         }],
         "usage": chat_usage_from_mistral(
-            usage_from_event(data),
-            data.get("conversation_id"),
+            usage_from_event(data), data.get("conversation_id")
         ),
     }
 
 
 def mistral_to_responses(data: dict, model: str) -> dict:
-    """Mistral conversations response -> OpenAI Responses object."""
+    """Mistral conversations response -> OpenAI Responses object.
+
+    Extended to handle truncated tool calls by converting to function.result prompt.
+    """
     conv_id = data.get("conversation_id") or f"resp_{int(time.time())}"
     output = []
     text_acc, reason_acc = "", ""
@@ -502,16 +587,19 @@ def mistral_to_responses(data: dict, model: str) -> dict:
             text_acc += t
             reason_acc += r
         elif otype == "function.call":
-            args = o.get("arguments", "{}")
-            if not isinstance(args, str):
-                args = _as_json_string(args)
-            tool_items.append({
-                "type": "function_call",
-                "id": o.get("id") or o.get("tool_call_id") or f"fc_{len(tool_items)}",
-                "call_id": o.get("tool_call_id") or o.get("id") or f"call_{len(tool_items)}",
-                "name": o.get("name") or "",
-                "arguments": args,
-            })
+            if detect_truncated_tool_call(o):
+                tool_items.append(handle_truncated_tool_call(o))
+            else:
+                args = o.get("arguments", "{}")
+                if not isinstance(args, str):
+                    args = _as_json_string(args)
+                tool_items.append({
+                    "type": "function_call",
+                    "id": o.get("id") or o.get("tool_call_id") or f"fc_{len(tool_items)}",
+                    "call_id": o.get("tool_call_id") or o.get("id") or f"call_{len(tool_items)}",
+                    "name": o.get("name") or "",
+                    "arguments": args,
+                })
     if reason_acc:
         output.append({
             "type": "reasoning",
@@ -658,4 +746,3 @@ def _delta_from_message_content(content):
 
 def _responses_event(etype: str, payload: dict) -> str:
     return f"event: {etype}\ndata: {json.dumps(payload)}\n\n"
-

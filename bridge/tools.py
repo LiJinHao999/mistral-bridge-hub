@@ -18,22 +18,49 @@ def _json_args_complete(args: str) -> bool:
     return True
 
 
-def sanitize_tool_args(args, tcid: str = "", name: str = ""):
-    """Normalize tool arguments to something that always parses as JSON.
+def tool_args_usable(args: str) -> bool:
+    """True when arguments are non-empty valid JSON (name-only is not ready)."""
+    text = (args or "").strip()
+    if not text:
+        return False
+    return _json_args_complete(text)
 
-    Mistral stores `arguments` on the conversation forever and replays it to the
-    model gateway on every later append. A blob the gateway cannot json.loads is
-    a permanent 400 on that conversation (see `upstream_history_corrupt`), so
-    nothing malformed may be sent upstream.
+
+def truncated_tool_placeholder(name: str = "") -> str:
+    """Valid JSON the client will execute as a failed tool call, not as a patch.
+
+    The next turn then sees a function_call + function_call_output pair, which
+    the model can act on, instead of an assistant text note that looks like a
+    reply and gets stored on the conversation.
     """
-    # dicts / lists are structurally valid already, and Mistral accepts them.
+    tool = name or "the tool"
+    return json.dumps({
+        "__truncated__": True,
+        "tool": name or None,
+        "message": (
+            "Arguments were cut off by the upstream token limit and never "
+            "formed valid JSON, so this call was not executed. Retry %s in "
+            "smaller chunks (shorter patches, fewer files, or a smaller write)."
+            % tool
+        ),
+    }, ensure_ascii=False)
+
+
+def resolve_tool_arguments(args, tcid: str = "", name: str = "", *, allow_empty: bool = True) -> tuple:
+    """Return (json_string, truncated). The string always parses as JSON."""
     if isinstance(args, (dict, list)):
-        return args
-    text = _as_json_string(args).strip() or "{}"
+        return _as_json_string(args), False
+    text = args if isinstance(args, str) else _as_json_string(args)
+    text = (text or "").strip()
+    if not text:
+        if allow_empty:
+            return "{}", False
+        log.warning(
+            "truncated tool args id=%s name=%s len=0 (cut before arguments)",
+            tcid or "?", name or "?",
+        )
+        return truncated_tool_placeholder(name), True
     if _json_args_complete(text):
-        # Claude Code wraps arguments it could not parse itself. Unwrap it when
-        # the raw blob is usable after all, so the model sees real arguments
-        # instead of the wrapper.
         try:
             obj = json.loads(text)
         except (TypeError, ValueError):
@@ -42,13 +69,25 @@ def sanitize_tool_args(args, tcid: str = "", name: str = ""):
             wrapper = obj.get("__unparsedToolInput")
             raw = wrapper.get("raw") if isinstance(wrapper, dict) else wrapper
             if isinstance(raw, str) and raw.strip() and _json_args_complete(raw):
-                return raw.strip()
-        return text
+                return raw.strip(), False
+        return text, False
     log.warning(
-        "tool args not valid JSON, replaced id=%s name=%s len=%d preview=%r",
+        "truncated tool args id=%s name=%s len=%d preview=%r",
         tcid or "?", name or "?", len(text), text[:200],
     )
-    return json.dumps({"__truncated__": "arguments were cut off upstream"})
+    return truncated_tool_placeholder(name), True
+
+
+def sanitize_tool_args(args, tcid: str = "", name: str = ""):
+    """Normalize tool arguments to something that always parses as JSON.
+
+    Mistral stores `arguments` on the conversation forever and replays it to the
+    model gateway on every later append. A blob the gateway cannot json.loads is
+    a permanent 400 on that conversation (see `upstream_history_corrupt`), so
+    nothing malformed may be sent upstream.
+    """
+    text, _truncated = resolve_tool_arguments(args, tcid, name, allow_empty=True)
+    return text
 
 
 def _preview_payload(value, limit: int = 200) -> tuple:

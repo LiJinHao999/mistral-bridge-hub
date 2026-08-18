@@ -31,7 +31,7 @@ from .utils import _as_json_string
 
 
 # ── Streaming ─────────────────────────────────────────────────────────────────
-async def stream_response(session, resp, model: str):
+async def stream_response(session, resp, model: str, conv_id: str = None, entries: list = None):
     """SSE proxy: Mistral conversations stream -> OpenAI chat.completion.chunk.
 
     `resp` is already open and answered 200 — the caller keeps the upstream
@@ -39,9 +39,12 @@ async def stream_response(session, resp, model: str):
     Starlette sends the status line before iterating a StreamingResponse, so an
     upstream 402/429 reported from in here would reach AxonHub as a 200 and its
     key pool would never rotate off the exhausted key.
+
+    `conv_id` is the matched conversation id (None for a create). `entries` is
+    the match-side entry list, used to cache the conversation state for the next
+    append.
     """
     chunk_id = f"chatcmpl-{int(time.time())}"
-    conv_id = None
     try:
         saw_tool_call = False
         sent_role = False

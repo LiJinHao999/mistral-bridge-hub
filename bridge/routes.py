@@ -13,7 +13,7 @@ from .cache import (
     mark_conversation_busy,
     pending_call_ids_from_outputs,
 )
-from .config import MODEL, MISTRAL_BASE, PORT, UPSTREAM_TIMEOUT, log
+from .config import MODEL, PORT, log
 from .models import local_model_card, local_models_list
 from .streaming import stream_anthropic, stream_response, stream_responses
 from .translate import (
@@ -30,7 +30,6 @@ from .translate import (
 )
 from .upstream import post_conversation, proxy_mistral_get, strip_for_append
 from .utils import (
-    _auth_headers,
     content_to_text,
     error_response,
     input_kinds,
@@ -51,13 +50,26 @@ async def chat(request: Request):
 
     model = resolve_model(body.get("model"))
     try:
-        payload = openai_to_mistral(body)
+        payload, entries = openai_to_mistral(body)
     except Exception as e:
         return error_response(422, f"Payload translation error: {e}", "invalid_payload")
 
     upstream_key = resolve_key(request)
     if not upstream_key:
         return error_response(401, "Missing API key (client Authorization or MISTRAL_KEY)", "missing_api_key")
+
+    prev = None
+    append_payload = None
+    match = find_append_match(entries)
+    if match:
+        prev = match[0]
+        append_payload = strip_for_append(payload)
+        append_payload["inputs"] = match[1]
+        mark_conversation_busy(prev, True)
+        log.info(
+            "chat append match conv=%s new_entries=%d total_entries=%d kinds=%s",
+            prev, len(match[1]), len(entries), input_kinds(match[1]),
+        )
 
     raw_msgs = body.get("messages") if isinstance(body.get("messages"), list) else []
     raw_roles = []
@@ -74,7 +86,7 @@ async def chat(request: Request):
             txt = content_to_text(m.get("content")).replace("\n", " ")
             user_preview.append(txt[:80] + ("…" if len(txt) > 80 else ""))
     log.info(
-        "chat → %s raw=%s users=%s inputs=%s tools=%d reason=%s max_tokens=%s store=%s",
+        "chat → %s raw=%s users=%s inputs=%s tools=%d reason=%s max_tokens=%s store=%s prev=%s",
         model,
         raw_roles,
         user_preview,
@@ -83,73 +95,76 @@ async def chat(request: Request):
         payload.get("completion_args", {}).get("reasoning_effort"),
         payload.get("completion_args", {}).get("max_tokens"),
         payload.get("store"),
+        prev,
     )
 
     if body.get("stream"):
         payload["stream"] = True
+        if append_payload:
+            append_payload["stream"] = True
 
-        # Same reason as /v1/responses: the status line is committed before the
-        # generator runs, so the upstream request has to happen out here for a
-        # 402/429 to reach AxonHub as a real status instead of a 200.
         session = aiohttp.ClientSession()
         try:
-            resp = await session.post(
-                MISTRAL_BASE,
-                headers=_auth_headers(upstream_key),
-                json=payload,
-                timeout=UPSTREAM_TIMEOUT,
-            )
+            resp, reason, err_text = await post_conversation(session, upstream_key, payload, prev, append_payload)
         except (aiohttp.ClientError, asyncio.TimeoutError) as e:
             log.error("connection error: %s", e)
             await session.close()
+            mark_conversation_busy(prev, False)
             return error_response(502, str(e), "upstream_unreachable")
-        if resp.status != 200:
-            text = await resp.text()
-            log.warning("upstream %s: %s", resp.status, text[:200])
-            resp.release()
+        if resp is None or resp.status != 200:
+            status = resp.status if resp is not None else 502
+            text = err_text or (await resp.text() if resp is not None else "upstream unreachable")
+            if resp is not None:
+                resp.release()
             await session.close()
-            return error_response(
-                resp.status if resp.status < 500 else 502, text[:500]
-            )
+            mark_conversation_busy(prev, False)
+            return error_response(status if status < 500 else 502, text[:500])
 
         return StreamingResponse(
-            stream_response(session, resp, model),
+            stream_response(session, resp, model, prev, entries),
             media_type="text/event-stream",
             headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
         )
 
     async with aiohttp.ClientSession() as session:
         try:
-            async with session.post(
-                MISTRAL_BASE,
-                headers=_auth_headers(upstream_key),
-                json=payload,
-                timeout=UPSTREAM_TIMEOUT,
-            ) as resp:
-                text = await resp.text()
+            resp, reason, err_text = await post_conversation(session, upstream_key, payload, prev, append_payload)
+            try:
                 if resp.status != 200:
-                    log.warning("upstream %s: %s", resp.status, text[:200])
                     return error_response(
                         resp.status if resp.status < 500 else 502,
-                        text[:500],
+                        (err_text or await resp.text())[:500],
                     )
-                data = json.loads(text)
+                data = json.loads(await resp.text())
+            finally:
+                resp.release()
         except (aiohttp.ClientError, asyncio.TimeoutError) as e:
             log.error("connection error: %s", e)
             return error_response(502, str(e), "upstream_unreachable")
         except json.JSONDecodeError:
             log.error("bad upstream JSON")
             return error_response(502, "Bad upstream response")
+        finally:
+            mark_conversation_busy(prev, False)
 
     translated = mistral_to_openai(data, model)
+    conv_id = translated.get("id")
     usage = translated.get("usage") or {}
-    fields = mistral_usage_fields(usage_from_event(data), translated.get("id"))
+    raw_usage = usage_from_event(data) or {}
+    fields = mistral_usage_fields(raw_usage, conv_id)
+    cache_conversation(
+        conv_id,
+        entries,
+        pending_call_ids_from_outputs(data),
+        prompt_tokens=usage.get("prompt_tokens") or 0,
+    )
     log.info(
-        "chat done conv=%s usage=%s raw_usage_keys=%s",
-        translated.get("id"),
+        "chat done conv=%s reason=%s usage=%s raw_usage_keys=%s",
+        conv_id,
+        reason,
         f"{usage.get('prompt_tokens', 0)}+{usage.get('completion_tokens', 0)}={usage.get('total_tokens', 0)}"
         f" {cache_log_label(fields)}",
-        sorted((usage_from_event(data) or {}).keys()),
+        sorted(raw_usage.keys()),
     )
     return Response(
         status_code=200,
@@ -308,11 +323,12 @@ async def responses(request: Request):
 
 @router.post("/v1/messages")
 async def messages(request: Request):
-    """Anthropic Messages API -> Mistral Conversations create.
+    """Anthropic Messages API -> Mistral Conversations create or append.
 
-    Stateless (always creates a new conversation from the full ``messages``
-    window), mirroring how ``/v1/chat/completions`` works.  Auth accepts
-    both ``x-api-key`` (Anthropic) and ``Authorization: Bearer`` (OpenAI).
+    Auth accepts both ``x-api-key`` (Anthropic) and ``Authorization: Bearer``
+    (OpenAI).  Append matching works the same as ``/v1/responses`` and
+    ``/v1/chat/completions``: the messages window is normalized to
+    Conversations entries and matched by tool_call_id + message-prefix hash.
     """
     try:
         body = await request.json()
@@ -321,13 +337,26 @@ async def messages(request: Request):
 
     model = resolve_model(body.get("model"))
     try:
-        payload = anthropic_to_mistral(body)
+        payload, entries = anthropic_to_mistral(body)
     except Exception as e:
         return error_response(422, f"Payload translation error: {e}", "invalid_payload")
 
     upstream_key = resolve_key(request)
     if not upstream_key:
         return error_response(401, "Missing API key (x-api-key or Authorization or MISTRAL_KEY)", "missing_api_key")
+
+    prev = None
+    append_payload = None
+    match = find_append_match(entries)
+    if match:
+        prev = match[0]
+        append_payload = strip_for_append(payload)
+        append_payload["inputs"] = match[1]
+        mark_conversation_busy(prev, True)
+        log.info(
+            "messages append match conv=%s new_entries=%d total_entries=%d kinds=%s",
+            prev, len(match[1]), len(entries), input_kinds(match[1]),
+        )
 
     raw_msgs = body.get("messages") if isinstance(body.get("messages"), list) else []
     raw_roles = []
@@ -341,7 +370,7 @@ async def messages(request: Request):
             txt = content_to_text(message_entry.get("content")).replace("\n", " ")
             user_preview.append(txt[:80] + ("…" if len(txt) > 80 else ""))
     log.info(
-        "messages → %s raw=%s users=%s inputs=%s tools=%d reason=%s max_tokens=%s store=%s",
+        "messages → %s raw=%s users=%s inputs=%s tools=%d reason=%s max_tokens=%s store=%s prev=%s",
         model,
         raw_roles,
         user_preview,
@@ -350,62 +379,75 @@ async def messages(request: Request):
         payload.get("completion_args", {}).get("reasoning_effort"),
         payload.get("completion_args", {}).get("max_tokens"),
         payload.get("store"),
+        prev,
     )
 
     if body.get("stream"):
         payload["stream"] = True
+        if append_payload:
+            append_payload["stream"] = True
 
         session = aiohttp.ClientSession()
         try:
-            resp = await session.post(
-                MISTRAL_BASE,
-                headers=_auth_headers(upstream_key),
-                json=payload,
-                timeout=UPSTREAM_TIMEOUT,
-            )
+            resp, reason, err_text = await post_conversation(session, upstream_key, payload, prev, append_payload)
         except (aiohttp.ClientError, asyncio.TimeoutError) as e:
             log.error("connection error: %s", e)
             await session.close()
+            mark_conversation_busy(prev, False)
             return error_response(502, str(e), "upstream_unreachable")
-        if resp.status != 200:
-            text = await resp.text()
-            log.warning("upstream %s: %s", resp.status, text[:200])
-            resp.release()
+        if resp is None or resp.status != 200:
+            status = resp.status if resp is not None else 502
+            text = err_text or (await resp.text() if resp is not None else "upstream unreachable")
+            if resp is not None:
+                resp.release()
             await session.close()
-            return error_response(
-                resp.status if resp.status < 500 else 502, text[:500]
-            )
+            mark_conversation_busy(prev, False)
+            return error_response(status if status < 500 else 502, text[:500])
 
         return StreamingResponse(
-            stream_anthropic(session, resp, model),
+            stream_anthropic(session, resp, model, prev, entries),
             media_type="text/event-stream",
             headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
         )
 
     async with aiohttp.ClientSession() as session:
         try:
-            async with session.post(
-                MISTRAL_BASE,
-                headers=_auth_headers(upstream_key),
-                json=payload,
-                timeout=UPSTREAM_TIMEOUT,
-            ) as resp:
-                text = await resp.text()
+            resp, reason, err_text = await post_conversation(session, upstream_key, payload, prev, append_payload)
+            try:
                 if resp.status != 200:
-                    log.warning("upstream %s: %s", resp.status, text[:200])
                     return error_response(
                         resp.status if resp.status < 500 else 502,
-                        text[:500],
+                        (err_text or await resp.text())[:500],
                     )
-                data = json.loads(text)
+                data = json.loads(await resp.text())
+            finally:
+                resp.release()
         except (aiohttp.ClientError, asyncio.TimeoutError) as e:
             log.error("connection error: %s", e)
             return error_response(502, str(e), "upstream_unreachable")
         except json.JSONDecodeError:
             log.error("bad upstream JSON")
             return error_response(502, "Bad upstream response")
+        finally:
+            mark_conversation_busy(prev, False)
 
     translated = mistral_to_anthropic(data, model)
+    conv_id = translated.get("id")
+    raw_usage = usage_from_event(data) or {}
+    fields = mistral_usage_fields(raw_usage, conv_id)
+    cache_conversation(
+        conv_id,
+        entries,
+        pending_call_ids_from_outputs(data),
+        prompt_tokens=fields["prompt"] or 0,
+    )
+    log.info(
+        "messages done conv=%s reason=%s usage=%s raw_usage_keys=%s",
+        conv_id,
+        reason,
+        f"{fields['prompt']}+{fields['completion']} {cache_log_label(fields)}",
+        sorted(raw_usage.keys()),
+    )
     return Response(
         status_code=200,
         media_type="application/json",
