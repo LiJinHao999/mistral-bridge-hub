@@ -64,10 +64,12 @@ async def stream_response(session, resp, model: str):
             yielded += 1
             return f"data: {json.dumps(_openai_chunk(model, delta, chunk_id=chunk_id))}\n\n"
 
+        saw_done = False
         async for etype, data in iter_conversation_events(resp):
             if etype and len(seen_types) < 8:
                 seen_types.append(etype)
             if etype in ("done",):
+                saw_done = True
                 break
             if etype == "conversation.response.started":
                 conv_id = data.get("conversation_id") or conv_id
@@ -80,6 +82,7 @@ async def stream_response(session, resp, model: str):
                 yield "data: [DONE]\n\n"
                 return
             if etype == "conversation.response.done":
+                saw_done = True
                 conv_id = data.get("conversation_id") or conv_id
                 raw_usage = usage_from_event(data) or raw_usage
                 break
@@ -149,6 +152,14 @@ async def stream_response(session, resp, model: str):
             )
             yield emit({"content": ("\n\n" + note) if text_acc else note})
 
+        if not saw_done and not text_acc.strip() and not saw_tool_call:
+            # Quiet EOF while still thinking: do not report a successful empty
+            # stop. The client has to see an error so it retries.
+            msg = "upstream stream ended before any visible output"
+            log.warning("chat stream cut with no visible output (think=%d) → error", len(think_acc))
+            yield f"data: {json.dumps({'error': {'message': msg, 'type': 'upstream_error'}})}\n\n"
+            yield "data: [DONE]\n\n"
+            return
         if not sent_role:
             yield emit({"content": ""})
         finish_reason = "tool_calls" if saw_tool_call else "stop"
@@ -230,6 +241,17 @@ async def stream_responses(session, resp, reason, opener, model: str, conv_id: s
     def emitted_output() -> bool:
         return text_started or reason_started or bool(tool_state)
 
+    def visible_output() -> bool:
+        """Text or a complete tool call — reasoning alone is not something the
+        client can show or act on, so a cut that only thought must fail."""
+        return bool(
+            text_started
+            or any(
+                state.get("name") and _json_args_complete(state.get("args") or "{}")
+                for state in tool_state.values()
+            )
+        )
+
     def next_seq():
         nonlocal seq
         seq += 1
@@ -242,9 +264,14 @@ async def stream_responses(session, resp, reason, opener, model: str, conv_id: s
         return idx
 
     def failed(message: str, rid_: str = ""):
+        nonlocal rid
+        if rid_:
+            rid = rid_
+        obj = response_obj("failed")
+        obj["error"] = {"message": message, "type": "upstream_error"}
         return _responses_event("response.failed", {
             "type": "response.failed",
-            "response": {"id": rid_ or rid, "error": {"message": message}},
+            "response": obj,
         })
 
     def response_obj(status: str, output=None, usage=None):
@@ -326,6 +353,18 @@ async def stream_responses(session, resp, reason, opener, model: str, conv_id: s
         for ev in ensure_created():
             yield ev
 
+        # A cut with nothing the client can show must fail, not complete. Closing
+        # the reasoning item as done and then completing made AxonHub/Cursor treat
+        # a mid-thought disconnect as a successful empty turn.
+        if partial and not visible_output():
+            log.warning(
+                "stream cut with no visible output (think=%d tools=%d) → failed",
+                len(reason_acc), len(tool_state),
+            )
+            terminal = True
+            yield failed("upstream stream ended before any visible output")
+            return
+
         # A cut stream leaves the last arguments blob half written. Upstream has
         # already stored it on this conversation, and replays it to the gateway
         # on every later append as a permanent 400, so the thread is burnt:
@@ -352,7 +391,6 @@ async def stream_responses(session, resp, reason, opener, model: str, conv_id: s
         # that text would be stored on the conversation and replayed on every
         # later append, so a long ramble would cost tokens for the rest of the
         # thread and invite the agent to act on half-formed reasoning.
-        # A cut stream is different and is failed below, where retrying helps.
         surviving_tools = [
             state for _, state in tool_state.items()
             if state.get("name") and _json_args_complete(state.get("args") or "{}")
@@ -503,15 +541,10 @@ async def stream_responses(session, resp, reason, opener, model: str, conv_id: s
         terminal = True
         if partial:
             # Truncated tool calls already evicted the thread above. For a
-            # thinking-only or text cut, keep the previous cache record so the
-            # next turn can still append — dropping it is what made every
-            # disconnect throw away the whole prompt-cache chain.
-            # Reasoning alone is not something the client can show or act on,
-            # so it must not count as output here: reporting completed made the
-            # caller treat a cut turn as a successful empty one and never retry.
-            if not text_started and not tool_names:
-                yield failed("upstream stream ended before any visible output")
-                return
+            # text cut, keep the previous cache record so the next turn can
+            # still append — dropping it is what made every disconnect throw
+            # away the whole prompt-cache chain. Thinking-only cuts failed
+            # above and never reach here.
             if entries and rid and not truncated:
                 cache_conversation(
                     rid,
@@ -542,6 +575,7 @@ async def stream_responses(session, resp, reason, opener, model: str, conv_id: s
             rid = conv_id if reason == "append" else ""
             try:
                 log.info("responses stream %s", reason)
+                saw_done = False
                 async for etype, data in iter_conversation_events(resp):
                     got_event = True
                     if etype and len(seen_types) < 8:
@@ -555,7 +589,7 @@ async def stream_responses(session, resp, reason, opener, model: str, conv_id: s
                     if etype == "conversation.response.error":
                         msg = data.get("message") or "upstream stream error"
                         log.warning("stream error: %s", msg)
-                        if emitted_output():
+                        if visible_output():
                             for ev in finalize(partial=True):
                                 yield ev
                             return
@@ -563,6 +597,7 @@ async def stream_responses(session, resp, reason, opener, model: str, conv_id: s
                         yield failed(msg, rid)
                         return
                     if etype in ("conversation.response.done", "done"):
+                        saw_done = True
                         rid = (data or {}).get("conversation_id") or rid
                         raw_usage = merge_raw_usage(raw_usage, usage_from_event(data))
                         break
@@ -688,19 +723,34 @@ async def stream_responses(session, resp, reason, opener, model: str, conv_id: s
                                 "sequence_number": next_seq(),
                             })
 
+                if not saw_done:
+                    # Quiet EOF after thinking deltas: no exception, no done
+                    # event. Treating that as a clean finish is what made a
+                    # mid-thought disconnect look like an empty successful turn.
+                    log.warning(
+                        "upstream stream ended without conversation.response.done "
+                        "(emitted=%s visible=%s think=%d)",
+                        emitted_output(), visible_output(), len(reason_acc),
+                    )
+                    for ev in finalize(partial=True):
+                        yield ev
+                    return
                 for ev in finalize():
                     yield ev
                 return
             except (aiohttp.ClientError, asyncio.TimeoutError) as e:
                 last_err = e
                 log.error(
-                    "connection error: %s (reason=%s got_event=%s emitted=%s reopened=%s)",
-                    e, reason, got_event, emitted_output(), reopened,
+                    "connection error: %s (reason=%s got_event=%s emitted=%s visible=%s reopened=%s)",
+                    e, reason, got_event, emitted_output(), visible_output(), reopened,
                 )
                 if emitted_output():
                     # Tokens are already on the wire; a retry would duplicate
-                    # them. Close the turn with what arrived.
-                    log.warning("upstream cut mid-stream → completing partial turn")
+                    # them. Close with what arrived, or fail if nothing visible.
+                    log.warning(
+                        "upstream cut mid-stream → %s",
+                        "completing partial turn" if visible_output() else "failed (no visible output)",
+                    )
                     for ev in finalize(partial=True):
                         yield ev
                     return
