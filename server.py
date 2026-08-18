@@ -703,6 +703,13 @@ def cache_conversation(conv_id: str, entries: list, pending_ids: list = None, pr
     rec["head_len"] = len(messages)
     rec["head_hash"] = _messages_hash(messages)
     rec["settled"] |= {tcid for tcid in result_ids if tcid}
+    # This turn is done and the conversation's state is known, so it can serve
+    # the next append right now. Waiting for the stream generator's finally to
+    # clear the flag is too late: it only runs once the client has consumed the
+    # whole SSE body, and the client fires its next request the moment it reads
+    # response.completed. That race skipped the match on every other turn and
+    # fell back to create, throwing away the whole prompt cache each time.
+    rec["busy_until"] = 0
     rec["pending"] = [
         tcid for tcid in (pending_ids or []) if tcid and tcid not in rec["settled"]
     ]
