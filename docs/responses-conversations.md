@@ -78,7 +78,7 @@ append 官方允许的字段只有：`inputs`、`completion_args`、`store`、`s
 | `{type:"function_call_output", call_id, output}` | `{type:"function.result", tool_call_id, result}` |
 | `{role:"tool", tool_call_id, content}` | 同上 `function.result` |
 | `{role:"system"\|"developer", content}` | 并入 `instructions`，不进 `inputs` |
-| `{type:"reasoning", …}` | 丢掉（Conversations 用 thinking 块，不吃 reasoning item） |
+| `{type:"reasoning", …}` | **create**：译成 assistant `ThinkChunk`（可带 `signature`），按最近优先、总长 cap（`THINKING_CREATE_MAX_CHARS`）。**append**：不重放（线程里已有）。匹配哈希会剥掉 thinking。 |
 
 `function.result` 官方示例：
 

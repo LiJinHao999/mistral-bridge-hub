@@ -32,6 +32,11 @@ APPEND_CONFLICT_BACKOFF = 0.4
 # Mistral prompt-cache blocks are 64 tokens. Conversations usage omits
 # cached_tokens, so we floor the local estimate to this size.
 CACHE_BLOCK_TOKENS = 64
+# On create, replay ThinkChunks from the client window so a dropped
+# conversation does not force the model to re-plan from zero. Cap the
+# replayed text (most recent first) so a 30k-char ramble cannot double
+# an already 40–80k-token create prompt.
+THINKING_CREATE_MAX_CHARS = 12000
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger("mistral-bridge")

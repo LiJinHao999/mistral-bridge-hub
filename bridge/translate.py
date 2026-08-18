@@ -12,6 +12,8 @@ from .tools import (
     map_tool_choice,
     normalize_messages,
     normalize_tools,
+    strip_thinking_for_match,
+    trim_thinking_for_create,
 )
 from .utils import _as_int, _as_json_string, _num, resolve_model
 
@@ -103,8 +105,10 @@ def openai_to_mistral(body: dict) -> dict:
     messages = body.get("messages") or []
     if not isinstance(messages, list):
         messages = []
-    inputs, instructions = normalize_messages(messages)
-    inputs = compact_settled_tools(inputs)
+    # Chat Completions is always a new conversation, so replay ThinkChunks
+    # the same way create-after-miss does on /v1/responses.
+    inputs, instructions = normalize_messages(messages, include_thinking=True)
+    inputs = compact_settled_tools(trim_thinking_for_create(inputs))
     if not inputs:
         inputs = [{"role": "user", "content": " "}]
 
@@ -122,7 +126,7 @@ def openai_to_mistral(body: dict) -> dict:
     return payload
 
 
-def responses_input_to_entries(inp) -> tuple:
+def responses_input_to_entries(inp, include_thinking: bool = False) -> tuple:
     """Responses `input` -> same Conversations entries as Chat `messages`."""
     if inp is None:
         return [], ""
@@ -133,7 +137,7 @@ def responses_input_to_entries(inp) -> tuple:
         inp = [inp]
     if not isinstance(inp, list):
         return [], ""
-    return normalize_messages(inp)
+    return normalize_messages(inp, include_thinking=include_thinking)
 
 
 def responses_to_mistral(body: dict) -> tuple:
@@ -141,11 +145,14 @@ def responses_to_mistral(body: dict) -> tuple:
 
     Compact only the create payload. Append matching must see native
     function.call / function.result ids or it will skip pending results.
+    Thinking is replayed on create (Mistral's ThinkChunk) so a dropped
+    thread does not force the model to re-plan; matching strips it so
+    the prefix hash stays the same as a window without traces.
     """
     inp = body.get("input", body.get("messages", []))
-    entries, extra_instr = responses_input_to_entries(inp)
-    match_entries = entries
-    compacted = compact_settled_tools(entries)
+    entries, extra_instr = responses_input_to_entries(inp, include_thinking=True)
+    match_entries = strip_thinking_for_match(entries)
+    compacted = compact_settled_tools(trim_thinking_for_create(entries))
     if not compacted:
         compacted = [{"role": "user", "content": " "}]
         if not match_entries:

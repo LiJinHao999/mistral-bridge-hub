@@ -2,7 +2,7 @@
 
 import json
 
-from .config import log
+from .config import THINKING_CREATE_MAX_CHARS, log
 from .utils import _as_json_string, content_to_text
 
 
@@ -170,19 +170,251 @@ def emit_function_result(item: dict, call_names=None):
     return sent
 
 
-def normalize_messages(messages: list) -> tuple:
+def _flatten_thinking(block) -> str:
+    """Pull plain thinking text out of a Responses / Chat / Mistral block."""
+    if isinstance(block, str):
+        return block.strip()
+    if not isinstance(block, dict):
+        return ""
+    parts = []
+    summary = block.get("summary")
+    if isinstance(summary, list):
+        for item in summary:
+            if isinstance(item, str) and item:
+                parts.append(item)
+            elif isinstance(item, dict) and item.get("text"):
+                parts.append(item.get("text") or "")
+    nested = block.get("thinking") if block.get("thinking") is not None else block.get("reasoning")
+    if isinstance(nested, str) and nested:
+        parts.append(nested)
+    elif isinstance(nested, list):
+        for item in nested:
+            if isinstance(item, str) and item:
+                parts.append(item)
+            elif isinstance(item, dict) and item.get("text"):
+                parts.append(item.get("text") or "")
+    if not parts:
+        if isinstance(block.get("text"), str) and block["text"]:
+            parts.append(block["text"])
+        elif isinstance(block.get("content"), str) and block["content"]:
+            parts.append(block["content"])
+    return "".join(parts).strip()
+
+
+def _thinking_signature(block: dict) -> str:
+    """Mistral signature / OpenAI encrypted_content for replaying a ThinkChunk.
+
+    Synthetic Responses ids like `rs_0` are not signatures — omitting them is
+    safer than sending a value the gateway cannot verify.
+    """
+    if not isinstance(block, dict):
+        return ""
+    for key in ("encrypted_content", "signature"):
+        val = block.get(key)
+        if isinstance(val, str) and val.strip() and not val.startswith("rs_"):
+            return val.strip()
+    return ""
+
+
+def _usable_thinking(text: str) -> str:
+    """Drop empty traces and bridge notes; those must not be replayed as thought."""
+    text = (text or "").strip()
+    if not text or text.startswith("[bridge]"):
+        return ""
+    return text
+
+
+def _think_chunk(text: str, signature: str = "") -> dict:
+    chunk = {
+        "type": "thinking",
+        "thinking": [{"type": "text", "text": text}],
+    }
+    if signature:
+        chunk["signature"] = signature
+    return chunk
+
+
+def _assistant_content(text: str, thinking: str = "", signature: str = ""):
+    """String content, or [ThinkChunk, TextChunk] when a trace is being replayed."""
+    if thinking:
+        chunks = [_think_chunk(thinking, signature)]
+        if (text or "").strip():
+            chunks.append({"type": "text", "text": text})
+        return chunks
+    return text
+
+
+def _thinking_chars(content) -> int:
+    if not isinstance(content, list):
+        return 0
+    return sum(
+        len(_flatten_thinking(block))
+        for block in content
+        if isinstance(block, dict) and block.get("type") == "thinking"
+    )
+
+
+def _drop_think_chunks(content):
+    """Assistant content list -> plain text, thinking removed."""
+    if not isinstance(content, list):
+        return content
+    return "".join(
+        (block.get("text") or "")
+        for block in content
+        if isinstance(block, dict) and block.get("type") == "text"
+    )
+
+
+def _truncate_think_chunks(content, keep_chars: int, signature: str = ""):
+    """Keep the suffix of thinking text (most recent) up to keep_chars."""
+    if not isinstance(content, list) or keep_chars <= 0:
+        return _drop_think_chunks(content)
+    traces = []
+    texts = []
+    sig = signature
+    for block in content:
+        if not isinstance(block, dict):
+            continue
+        if block.get("type") == "thinking":
+            traces.append(_flatten_thinking(block))
+            sig = sig or _thinking_signature(block)
+        elif block.get("type") == "text":
+            texts.append(block.get("text") or "")
+    joined = "".join(traces)
+    if len(joined) > keep_chars:
+        joined = joined[-keep_chars:]
+        sig = ""
+    return _assistant_content("".join(texts), joined, sig)
+
+
+def strip_thinking_for_match(entries: list) -> list:
+    """Match-side view: thinking must not affect the message-prefix hash.
+
+    A thinking-only assistant (no visible text) is dropped. Tool entries stay.
+    """
+    out = []
+    for entry in entries or []:
+        if not isinstance(entry, dict) or entry.get("role") != "assistant":
+            out.append(entry)
+            continue
+        content = entry.get("content")
+        if not isinstance(content, list):
+            out.append(entry)
+            continue
+        text = _drop_think_chunks(content)
+        if text.strip():
+            rewritten = dict(entry)
+            rewritten["content"] = text
+            out.append(rewritten)
+    return out
+
+
+def trim_thinking_for_create(entries: list, max_chars: int = None) -> list:
+    """Keep the most recent ThinkChunks on a create payload, under a char cap.
+
+    Older traces become plain assistant text. A single oversize newest trace
+    is suffix-truncated (and loses its signature — it is no longer whole).
+    A thinking-only assistant that does not fit the cap is dropped.
+    """
+    if not entries:
+        return entries
+    budget = THINKING_CREATE_MAX_CHARS if max_chars is None else max_chars
+    indexed = [
+        (i, _thinking_chars(entry.get("content")))
+        for i, entry in enumerate(entries)
+        if isinstance(entry, dict) and entry.get("role") == "assistant"
+        and _thinking_chars(entry.get("content"))
+    ]
+    if not indexed:
+        return entries
+    # i -> chars of thinking to keep. Missing = unchanged (no thinking).
+    keep = {}
+    remaining = budget
+    for i, n in reversed(indexed):
+        if n <= remaining:
+            keep[i] = n
+            remaining -= n
+        elif remaining > 0:
+            keep[i] = remaining
+            remaining = 0
+        else:
+            keep[i] = 0
+    out = []
+    for i, entry in enumerate(entries):
+        if i not in keep:
+            out.append(entry)
+            continue
+        content = entry.get("content")
+        n_keep = keep[i]
+        orig_n = _thinking_chars(content)
+        rewritten = dict(entry)
+        if n_keep <= 0:
+            text = _drop_think_chunks(content)
+            if (text or "").strip():
+                rewritten["content"] = text
+                out.append(rewritten)
+            continue
+        if n_keep >= orig_n:
+            out.append(entry)
+            continue
+        rewritten["content"] = _truncate_think_chunks(content, n_keep)
+        out.append(rewritten)
+    kept_chars = sum(
+        _thinking_chars(e.get("content"))
+        for e in out
+        if isinstance(e, dict)
+    )
+    log.info(
+        "thinking on create: traces=%d kept_chars=%d dropped_chars=%d cap=%d",
+        len(indexed), kept_chars, max(0, sum(n for _, n in indexed) - kept_chars), budget,
+    )
+    return out
+
+
+def normalize_messages(messages: list, include_thinking: bool = False) -> tuple:
     """OpenAI/Anthropic/Responses-shaped messages -> (Mistral inputs, instructions).
 
     assistant.tool_calls / function_call / Anthropic tool_use  -> function.call
     role=tool / function / function_call_output / tool_result  -> function.result
     system / developer                                         -> instructions
+    type=reasoning / thinking content blocks                   -> ThinkChunk on
+        the next assistant entry when include_thinking=True (create replay).
+        Append matching leaves these out so the prefix hash stays stable.
     """
     inputs = []
     instructions_parts = []
     call_names = {}
+    pending_thinking = ""
+    pending_sig = ""
+
+    def park_thinking(block):
+        nonlocal pending_thinking, pending_sig
+        if not include_thinking:
+            return
+        text = _usable_thinking(_flatten_thinking(block))
+        if not text:
+            return
+        pending_thinking += text
+        pending_sig = pending_sig or _thinking_signature(block)
+
+    def consume_pending() -> tuple:
+        nonlocal pending_thinking, pending_sig
+        text, sig = pending_thinking, pending_sig
+        pending_thinking, pending_sig = "", ""
+        return text, sig
+
+    def flush_thinking():
+        text, sig = consume_pending()
+        if not text:
+            return
+        inputs.append({
+            "role": "assistant",
+            "content": _assistant_content("", text, sig),
+        })
 
     for m in messages:
         if isinstance(m, str):
+            flush_thinking()
             if m.strip():
                 inputs.append({"role": "user", "content": m})
             continue
@@ -191,6 +423,10 @@ def normalize_messages(messages: list) -> tuple:
         role = m.get("role") or ""
         itype = m.get("type") or ""
         content = m.get("content")
+
+        if itype in ("reasoning", "thinking"):
+            park_thinking(m)
+            continue
 
         if itype in ("function_call_output", "tool_result") or role in ("tool", "function"):
             entry = emit_function_result(m, call_names)
@@ -201,6 +437,7 @@ def normalize_messages(messages: list) -> tuple:
         if itype == "function_call" or (
             role == "assistant" and m.get("name") and ("arguments" in m or "call_id" in m)
         ):
+            flush_thinking()
             name = m.get("name") or ""
             if not name:
                 fn = m.get("function") if isinstance(m.get("function"), dict) else {}
@@ -223,6 +460,8 @@ def normalize_messages(messages: list) -> tuple:
 
         openai_tcs = m.get("tool_calls") if isinstance(m.get("tool_calls"), list) else []
         leftover = []
+        inline_thinking = ""
+        inline_sig = ""
 
         if isinstance(content, list):
             for block in content:
@@ -253,7 +492,11 @@ def normalize_messages(messages: list) -> tuple:
                     if entry:
                         inputs.append(entry)
                 elif btype in ("thinking", "reasoning"):
-                    continue
+                    if include_thinking:
+                        t = _usable_thinking(_flatten_thinking(block))
+                        if t:
+                            inline_thinking += t
+                            inline_sig = inline_sig or _thinking_signature(block)
                 elif btype in ("text", "output_text", "input_text") or (
                     btype is None and "text" in block
                 ):
@@ -263,8 +506,21 @@ def normalize_messages(messages: list) -> tuple:
             text = content_to_text(content)
 
         if role == "assistant":
-            if text.strip():
-                inputs.append({"role": "assistant", "content": text})
+            extra = m.get("reasoning_content")
+            if include_thinking and extra:
+                t = _usable_thinking(
+                    extra if isinstance(extra, str) else _flatten_thinking(extra)
+                )
+                if t:
+                    inline_thinking = t + inline_thinking
+            parked, parked_sig = consume_pending()
+            thinking = parked + inline_thinking
+            sig = parked_sig or inline_sig
+            if text.strip() or thinking:
+                inputs.append({
+                    "role": "assistant",
+                    "content": _assistant_content(text, thinking, sig),
+                })
             for tc in openai_tcs:
                 name = ""
                 args = "{}"
@@ -287,9 +543,12 @@ def normalize_messages(messages: list) -> tuple:
                 )
                 if entry:
                     inputs.append(entry)
-        elif text.strip():
-            inputs.append({"role": "user" if role != "assistant" else "assistant", "content": text})
+        else:
+            flush_thinking()
+            if text.strip():
+                inputs.append({"role": "user" if role != "assistant" else "assistant", "content": text})
 
+    flush_thinking()
     return inputs, "\n\n".join(instructions_parts)
 
 
