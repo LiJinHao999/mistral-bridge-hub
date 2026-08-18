@@ -600,7 +600,11 @@ def normalize_tools(tools, functions=None) -> list:
 
 
 def map_tool_choice(tool_choice):
-    """OpenAI tool_choice -> Mistral CompletionArgs.tool_choice enum."""
+    """OpenAI / Anthropic tool_choice -> Mistral CompletionArgs.tool_choice enum.
+
+    OpenAI:  "auto" | "none" | "required" | {type:"function",function:{name}}
+    Anthropic: {type:"auto"} | {type:"any"} | {type:"tool",name:"…"}
+    """
     if tool_choice is None:
         return None
     if isinstance(tool_choice, str):
@@ -611,6 +615,14 @@ def map_tool_choice(tool_choice):
             return "none"
         return None
     if isinstance(tool_choice, dict):
+        t = str(tool_choice.get("type", "")).lower()
+        if t == "auto":
+            return "auto"
+        if t in ("any", "required"):
+            return "any"
+        if t in ("none", "off", "disabled"):
+            return "none"
+        # OpenAI {type:"function",…} or Anthropic {type:"tool",…} → force a call.
         return "any"
     return None
 

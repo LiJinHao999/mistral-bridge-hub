@@ -9,10 +9,19 @@ from .config import MISTRAL_KEY, MODEL
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
 def resolve_key(request: Request) -> str:
-    """Client Authorization takes precedence; fall back to server MISTRAL_KEY."""
+    """Client Authorization takes precedence; fall back to server MISTRAL_KEY.
+
+    Accepts both OpenAI-style ``Authorization: Bearer …`` and Anthropic-style
+    ``x-api-key: …`` headers so the same bridge serves both client families.
+    """
     auth_header = request.headers.get("Authorization", "")
     key = auth_header[7:].strip() if auth_header.startswith("Bearer ") else ""
-    return key or MISTRAL_KEY
+    if key:
+        return key
+    api_key = request.headers.get("x-api-key", "")
+    if api_key.strip():
+        return api_key.strip()
+    return MISTRAL_KEY
 
 
 def resolve_model(requested) -> str:

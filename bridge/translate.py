@@ -1,4 +1,4 @@
-"""OpenAI Chat / Responses <-> Mistral Conversations payload translation."""
+"""OpenAI Chat / Responses / Anthropic Messages <-> Mistral Conversations translation."""
 
 import json
 import time
@@ -6,7 +6,7 @@ import time
 from fastapi import Request
 
 from .cache import get_prompt_tokens
-from .config import CACHE_BLOCK_TOKENS
+from .config import CACHE_BLOCK_TOKENS, log
 from .tools import (
     compact_settled_tools,
     map_tool_choice,
@@ -15,7 +15,7 @@ from .tools import (
     strip_thinking_for_match,
     trim_thinking_for_create,
 )
-from .utils import _as_int, _as_json_string, _num, resolve_model
+from .utils import _as_int, _as_json_string, _num, content_to_text, resolve_model
 
 
 def resolve_reasoning(body: dict):
@@ -31,6 +31,13 @@ def resolve_reasoning(body: dict):
         if effort in ("none", "off", "disabled"):
             return "none"
         return "high"
+    # Anthropic Messages API: top-level ``thinking`` object.
+    thinking = body.get("thinking")
+    if isinstance(thinking, dict):
+        if thinking.get("type") == "disabled":
+            return "none"
+        if thinking.get("type") == "enabled":
+            return "high"
     options = body.get("options")
     if isinstance(options, dict):
         th = options.get("thinking")
@@ -173,6 +180,43 @@ def responses_to_mistral(body: dict) -> tuple:
     if tools:
         payload["tools"] = tools
     return payload, match_entries
+
+
+def anthropic_to_mistral(body: dict) -> dict:
+    """Anthropic Messages -> Conversations create. Always a new thread.
+
+    Anthropic keeps ``system`` separate from ``messages`` and uses content
+    blocks (tool_use / tool_result / thinking) that ``normalize_messages``
+    already understands.  ``max_tokens`` is required by the Anthropic API
+    so it is always present; ``top_k`` and ``stop_sequences`` have no
+    Mistral equivalent and are silently dropped.
+    """
+    messages = body.get("messages") or []
+    if not isinstance(messages, list):
+        messages = []
+    inputs, instructions = normalize_messages(messages, include_thinking=True)
+    inputs = compact_settled_tools(trim_thinking_for_create(inputs))
+    if not inputs:
+        inputs = [{"role": "user", "content": " "}]
+
+    system = body.get("system")
+    if system:
+        sys_text = content_to_text(system)
+        if sys_text.strip():
+            instructions = "\n\n".join(p for p in (sys_text, instructions) if p)
+
+    tools = normalize_tools(body.get("tools"))
+    payload = {
+        "model": resolve_model(body.get("model")),
+        "inputs": inputs,
+        "completion_args": completion_args_from_body(body),
+        "store": store_from_body(body, False),
+    }
+    if instructions:
+        payload["instructions"] = instructions
+    if tools:
+        payload["tools"] = tools
+    return payload
 
 
 # ── Response translation ──────────────────────────────────────────────────────
@@ -491,6 +535,75 @@ def mistral_to_responses(data: dict, model: str) -> dict:
         "model": model,
         "status": "completed",
         "output": output,
+        "usage": usage,
+    }
+
+
+def anthropic_usage_from_fields(fields: dict) -> dict:
+    """Flat usage fields -> Anthropic Messages usage."""
+    usage = {
+        "input_tokens": fields["prompt"],
+        "output_tokens": fields["completion"],
+    }
+    if fields["cache_write"]:
+        usage["cache_creation_input_tokens"] = fields["cache_write"]
+    if fields["cached"]:
+        usage["cache_read_input_tokens"] = fields["cached"]
+    return usage
+
+
+def mistral_to_anthropic(data: dict, model: str) -> dict:
+    """Mistral conversations response -> Anthropic Messages response."""
+    conv_id = data.get("conversation_id") or f"msg_{int(time.time())}"
+    content_blocks = []
+    text_acc, reason_acc = "", ""
+    tool_items = []
+    for output in data.get("outputs", []):
+        if not isinstance(output, dict):
+            continue
+        otype = output.get("type")
+        if otype == "message.output" and output.get("role", "assistant") == "assistant":
+            extracted_text, extracted_reasoning = extract_content_parts(output.get("content", ""))
+            text_acc += extracted_text
+            reason_acc += extracted_reasoning
+        elif otype == "function.call":
+            raw_args = output.get("arguments", "{}")
+            if isinstance(raw_args, str):
+                try:
+                    parsed_args = json.loads(raw_args)
+                except (json.JSONDecodeError, ValueError):
+                    parsed_args = {"raw": raw_args}
+            elif isinstance(raw_args, (dict, list)):
+                parsed_args = raw_args
+            else:
+                parsed_args = {"raw": _as_json_string(raw_args)}
+            tool_items.append({
+                "type": "tool_use",
+                "id": output.get("tool_call_id") or output.get("id") or f"toolu_{len(tool_items)}",
+                "name": output.get("name") or "",
+                "input": parsed_args,
+            })
+    if reason_acc:
+        content_blocks.append({"type": "thinking", "thinking": reason_acc})
+    content_blocks.extend(tool_items)
+    if text_acc or not content_blocks:
+        content_blocks.append({"type": "text", "text": text_acc})
+    stop_reason = "tool_use" if tool_items else "end_turn"
+    fields = mistral_usage_fields(usage_from_event(data), conv_id)
+    usage = anthropic_usage_from_fields(fields)
+    log.info(
+        "anthropic done conv=%s stop=%s usage=%s",
+        conv_id, stop_reason,
+        f"{usage['input_tokens']}+{usage['output_tokens']} {cache_log_label(fields)}",
+    )
+    return {
+        "id": conv_id,
+        "type": "message",
+        "role": "assistant",
+        "model": model,
+        "content": content_blocks,
+        "stop_reason": stop_reason,
+        "stop_sequence": None,
         "usage": usage,
     }
 

@@ -787,3 +787,268 @@ async def stream_responses(session, resp, reason, opener, model: str, conv_id: s
         if conv_id:
             mark_conversation_busy(conv_id, False)
 
+
+# ── Anthropic Messages stream ────────────────────────────────────────────────
+async def stream_anthropic(session, resp, model: str):
+    """SSE proxy: Mistral conversations stream -> Anthropic Messages events.
+
+    ``resp`` is already open and answered 200 — the caller keeps the upstream
+    request outside this generator so it can still return the real HTTP status
+    (same reason as ``stream_response`` / ``stream_responses``).
+    """
+    conv_id = None
+    msg_started = False
+    block_index = -1
+    current_type = None  # "text" | "thinking"
+
+    text_acc = ""
+    think_acc = ""
+    tool_state = {}
+    raw_usage = {}
+    seen_types = []
+    saw_tool_call = False
+
+    def sse(etype: str, payload: dict) -> str:
+        return f"event: {etype}\ndata: {json.dumps(payload)}\n\n"
+
+    def close_current_block():
+        nonlocal current_type
+        if current_type is not None:
+            idx = block_index
+            current_type = None
+            return sse("content_block_stop", {"type": "content_block_stop", "index": idx})
+        return ""
+
+    def start_block(block_type: str, content_block: dict):
+        nonlocal block_index, current_type
+        block_index += 1
+        current_type = block_type
+        return sse("content_block_start", {
+            "type": "content_block_start",
+            "index": block_index,
+            "content_block": content_block,
+        })
+
+    try:
+        async for etype, data in iter_conversation_events(resp):
+            if etype and len(seen_types) < 8:
+                seen_types.append(etype)
+
+            if etype == "conversation.response.started":
+                conv_id = data.get("conversation_id") or conv_id
+                raw_usage = usage_from_event(data) or raw_usage
+                if not msg_started:
+                    msg_started = True
+                    message_id = conv_id or f"msg_{int(time.time())}"
+                    started_usage = mistral_usage_fields(raw_usage, conv_id)
+                    yield sse("message_start", {
+                        "type": "message_start",
+                        "message": {
+                            "id": message_id,
+                            "type": "message",
+                            "role": "assistant",
+                            "model": model,
+                            "content": [],
+                            "stop_reason": None,
+                            "stop_sequence": None,
+                            "usage": {
+                                "input_tokens": started_usage["prompt"],
+                                "output_tokens": started_usage["completion"],
+                            },
+                        },
+                    })
+                    yield sse("ping", {"type": "ping"})
+                continue
+
+            if etype == "conversation.response.error":
+                error_message = data.get("message") or "upstream stream error"
+                log.warning("anthropic stream error: %s", error_message)
+                if current_type is not None:
+                    yield close_current_block()
+                yield sse("message_delta", {
+                    "type": "message_delta",
+                    "delta": {"stop_reason": "end_turn", "stop_sequence": None},
+                    "usage": {"output_tokens": 0},
+                })
+                yield sse("message_stop", {"type": "message_stop"})
+                return
+
+            if etype in ("conversation.response.done", "done"):
+                conv_id = (data or {}).get("conversation_id") or conv_id
+                raw_usage = usage_from_event(data) or raw_usage
+                break
+
+            if etype == "message.output.delta":
+                delta = _delta_from_message_content(data.get("content"))
+                if not delta:
+                    continue
+
+                thought = delta.get("reasoning_content") or ""
+                text = delta.get("content") or ""
+
+                if thought:
+                    think_acc += thought
+                    if current_type != "thinking":
+                        if current_type is not None:
+                            yield close_current_block()
+                        if not msg_started:
+                            msg_started = True
+                            message_id = conv_id or f"msg_{int(time.time())}"
+                            yield sse("message_start", {
+                                "type": "message_start",
+                                "message": {
+                                    "id": message_id,
+                                    "type": "message",
+                                    "role": "assistant",
+                                    "model": model,
+                                    "content": [],
+                                    "stop_reason": None,
+                                    "stop_sequence": None,
+                                    "usage": {"input_tokens": 0, "output_tokens": 0},
+                                },
+                            })
+                            yield sse("ping", {"type": "ping"})
+                        yield start_block("thinking", {"type": "thinking", "thinking": ""})
+                    yield sse("content_block_delta", {
+                        "type": "content_block_delta",
+                        "index": block_index,
+                        "delta": {"type": "thinking_delta", "thinking": thought},
+                    })
+
+                if text:
+                    text_acc += text
+                    if current_type != "text":
+                        if current_type is not None:
+                            yield close_current_block()
+                        if not msg_started:
+                            msg_started = True
+                            message_id = conv_id or f"msg_{int(time.time())}"
+                            yield sse("message_start", {
+                                "type": "message_start",
+                                "message": {
+                                    "id": message_id,
+                                    "type": "message",
+                                    "role": "assistant",
+                                    "model": model,
+                                    "content": [],
+                                    "stop_reason": None,
+                                    "stop_sequence": None,
+                                    "usage": {"input_tokens": 0, "output_tokens": 0},
+                                },
+                            })
+                            yield sse("ping", {"type": "ping"})
+                        yield start_block("text", {"type": "text", "text": ""})
+                    yield sse("content_block_delta", {
+                        "type": "content_block_delta",
+                        "index": block_index,
+                        "delta": {"type": "text_delta", "text": text},
+                    })
+
+            elif etype == "function.call.delta":
+                tool_call_id = data.get("tool_call_id") or data.get("id") or ""
+                name = data.get("name") or ""
+                incoming = data.get("arguments")
+                if incoming is None:
+                    incoming = ""
+                elif not isinstance(incoming, str):
+                    incoming = _as_json_string(incoming)
+                if tool_call_id not in tool_state:
+                    tool_state[tool_call_id] = {"index": len(tool_state), "args": "", "name": ""}
+                state = tool_state[tool_call_id]
+                fragment = _args_fragment(state["args"], incoming)
+                state["args"] += fragment
+                if name:
+                    state["name"] = name
+
+        if current_type is not None:
+            yield close_current_block()
+
+        tool_names = []
+        for tool_call_id, state in sorted(tool_state.items(), key=lambda kv: kv[1]["index"]):
+            name = state.get("name") or ""
+            args = state.get("args") or "{}"
+            if not name:
+                continue
+            if not _json_args_complete(args):
+                log.warning(
+                    "anthropic drop truncated tool call id=%s name=%s len=%d",
+                    tool_call_id, name, len(args),
+                )
+                continue
+            saw_tool_call = True
+            tool_names.append(name)
+            block_index += 1
+            yield sse("content_block_start", {
+                "type": "content_block_start",
+                "index": block_index,
+                "content_block": {
+                    "type": "tool_use",
+                    "id": tool_call_id,
+                    "name": name,
+                    "input": {},
+                },
+            })
+            yield sse("content_block_delta", {
+                "type": "content_block_delta",
+                "index": block_index,
+                "delta": {"type": "input_json_delta", "partial_json": args},
+            })
+            yield sse("content_block_stop", {
+                "type": "content_block_stop",
+                "index": block_index,
+            })
+            preview = args if len(args) < 200 else args[:200] + "…"
+            log.info("anthropic tool call id=%s name=%s args=%s", tool_call_id, name, preview)
+
+        if not text_acc and not think_acc and not saw_tool_call:
+            block_index += 1
+            yield sse("content_block_start", {
+                "type": "content_block_start",
+                "index": block_index,
+                "content_block": {"type": "text", "text": ""},
+            })
+            yield sse("content_block_stop", {
+                "type": "content_block_stop",
+                "index": block_index,
+            })
+
+        stop_reason = "tool_use" if saw_tool_call else "end_turn"
+        fields = mistral_usage_fields(raw_usage, conv_id)
+        final_usage = {
+            "input_tokens": fields["prompt"],
+            "output_tokens": fields["completion"],
+        }
+        if fields["cache_write"]:
+            final_usage["cache_creation_input_tokens"] = fields["cache_write"]
+        if fields["cached"]:
+            final_usage["cache_read_input_tokens"] = fields["cached"]
+
+        log.info(
+            "anthropic stream done conv=%s types=%s finish=%s tools=%s usage=%s think=%d",
+            conv_id, seen_types, stop_reason, tool_names,
+            f"{final_usage['input_tokens']}+{final_usage['output_tokens']}"
+            f" {cache_log_label(fields)}",
+            len(think_acc),
+        )
+
+        yield sse("message_delta", {
+            "type": "message_delta",
+            "delta": {"stop_reason": stop_reason, "stop_sequence": None},
+            "usage": {"output_tokens": final_usage["output_tokens"]},
+        })
+        yield sse("message_stop", {"type": "message_stop"})
+        return
+    except (aiohttp.ClientError, asyncio.TimeoutError) as error:
+        log.error("anthropic connection error mid-stream: %s", error)
+        if current_type is not None:
+            yield close_current_block()
+        yield sse("message_delta", {
+            "type": "message_delta",
+            "delta": {"stop_reason": "end_turn", "stop_sequence": None},
+            "usage": {"output_tokens": 0},
+        })
+        yield sse("message_stop", {"type": "message_stop"})
+    finally:
+        resp.release()
+        await session.close()
+

@@ -33,13 +33,14 @@ This bridge accepts OpenAI-shaped requests, forwards them as Conversations, and 
 |---|---|---|
 | `POST` | `/v1/chat/completions` | Stateless. Always **creates** a new conversation from the full `messages` window. |
 | `POST` | `/v1/responses` | Stateful. Matches a previous thread and **appends** when it can; otherwise creates. `response.id` is the Mistral `conversation_id`. |
+| `POST` | `/v1/messages` | Anthropic Messages API. Stateless like Chat Completions. Accepts `system`, `thinking`, `tool_use`/`tool_result` content blocks, and `x-api-key` auth. |
 | `GET` | `/v1/models` | Passthrough to Mistral; falls back to the configured local model. |
 | `GET` | `/v1/models/{id}` | Same, for a single model card. |
 | `GET` | `/health` | `{status, model, port}` |
 
-Auth: client `Authorization: Bearer …` wins; otherwise `MISTRAL_KEY`.
+Auth: client `Authorization: Bearer …` (OpenAI) or `x-api-key: …` (Anthropic) wins; otherwise `MISTRAL_KEY`.
 
-Streaming (`"stream": true`) is supported on both Chat Completions and Responses.
+Streaming (`"stream": true`) is supported on Chat Completions, Responses, and Messages.
 
 ## Quick start
 
@@ -67,9 +68,14 @@ curl http://127.0.0.1:8577/v1/responses \
   -H "Authorization: Bearer $MISTRAL_KEY" \
   -H "Content-Type: application/json" \
   -d '{"model":"glm-5-2","input":"hello","max_output_tokens":50}'
+
+curl http://127.0.0.1:8577/v1/messages \
+  -H "x-api-key: $MISTRAL_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{"model":"glm-5-2","messages":[{"role":"user","content":"hello"}],"max_tokens":50}'
 ```
 
-Point any OpenAI-compatible client at `http://127.0.0.1:8577/v1` with the same key.
+Point any OpenAI- or Anthropic-compatible client at `http://127.0.0.1:8577/v1` with the same key.
 
 ## Environment
 
@@ -109,10 +115,10 @@ mistral-bridge/
 │   ├── models.py          # local /v1/models fallback
 │   ├── tools.py           # function.call / function.result
 │   ├── cache.py           # create vs append matching
-│   ├── translate.py       # Chat / Responses ↔ Conversations
+│   ├── translate.py       # Chat / Responses / Anthropic ↔ Conversations
 │   ├── sse.py             # Mistral SSE parser
 │   ├── upstream.py        # create / append / GET
-│   ├── streaming.py       # SSE → OpenAI events
+│   ├── streaming.py       # SSE → OpenAI / Anthropic events
 │   ├── routes.py          # HTTP routes
 │   └── app.py             # FastAPI app
 ├── mistral-bridge.sh      # start/stop/restart/status/enable

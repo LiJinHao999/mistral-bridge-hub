@@ -33,13 +33,14 @@ Mistral 有两套接口：
 |---|---|---|
 | `POST` | `/v1/chat/completions` | 无状态。始终用完整 `messages` **新建**会话。 |
 | `POST` | `/v1/responses` | 有状态。能匹配到上一轮就 **append**，否则 create。`response.id` 即 Mistral `conversation_id`。 |
+| `POST` | `/v1/messages` | Anthropic Messages API。无状态，同 Chat Completions。支持 `system`、`thinking`、`tool_use`/`tool_result` content blocks 和 `x-api-key` 鉴权。 |
 | `GET` | `/v1/models` | 透传到 Mistral；失败则回退到本地配置的模型。 |
 | `GET` | `/v1/models/{id}` | 同上，单条模型卡片。 |
 | `GET` | `/health` | `{status, model, port}` |
 
-鉴权：客户端 `Authorization: Bearer …` 优先，否则用 `MISTRAL_KEY`。
+鉴权：客户端 `Authorization: Bearer …`（OpenAI）或 `x-api-key: …`（Anthropic）优先，否则用 `MISTRAL_KEY`。
 
-Chat Completions 和 Responses 都支持 `"stream": true`。
+Chat Completions、Responses 和 Messages 都支持 `"stream": true`。
 
 ## 快速开始
 
@@ -67,9 +68,14 @@ curl http://127.0.0.1:8577/v1/responses \
   -H "Authorization: Bearer $MISTRAL_KEY" \
   -H "Content-Type: application/json" \
   -d '{"model":"glm-5-2","input":"hello","max_output_tokens":50}'
+
+curl http://127.0.0.1:8577/v1/messages \
+  -H "x-api-key: $MISTRAL_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{"model":"glm-5-2","messages":[{"role":"user","content":"hello"}],"max_tokens":50}'
 ```
 
-任意 OpenAI 兼容客户端把 base URL 指到 `http://127.0.0.1:8577/v1`，用同一把 key 即可。
+任意 OpenAI 或 Anthropic 兼容客户端把 base URL 指到 `http://127.0.0.1:8577/v1`，用同一把 key 即可。
 
 ## 环境变量
 
@@ -109,10 +115,10 @@ mistral-bridge/
 │   ├── models.py          # 本地 /v1/models 回退
 │   ├── tools.py           # function.call / function.result
 │   ├── cache.py           # create vs append 匹配
-│   ├── translate.py       # Chat / Responses ↔ Conversations
+│   ├── translate.py       # Chat / Responses / Anthropic ↔ Conversations
 │   ├── sse.py             # Mistral SSE 解析
 │   ├── upstream.py        # create / append / GET
-│   ├── streaming.py       # SSE → OpenAI 事件
+│   ├── streaming.py       # SSE → OpenAI / Anthropic 事件
 │   ├── routes.py          # HTTP 路由
 │   └── app.py             # FastAPI 应用
 ├── mistral-bridge.sh      # start/stop/restart/status/enable

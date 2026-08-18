@@ -1,4 +1,4 @@
-"""HTTP routes: Chat Completions, Responses, models, health."""
+"""HTTP routes: Chat Completions, Responses, Anthropic Messages, models, health."""
 
 import asyncio
 import json
@@ -15,10 +15,12 @@ from .cache import (
 )
 from .config import MODEL, MISTRAL_BASE, PORT, UPSTREAM_TIMEOUT, log
 from .models import local_model_card, local_models_list
-from .streaming import stream_response, stream_responses
+from .streaming import stream_anthropic, stream_response, stream_responses
 from .translate import (
+    anthropic_to_mistral,
     cache_log_label,
     extract_previous_id,
+    mistral_to_anthropic,
     mistral_to_openai,
     mistral_to_responses,
     mistral_usage_fields,
@@ -297,6 +299,113 @@ async def responses(request: Request):
         f" {cache_log_label(fields)}",
         json.dumps(raw_usage, ensure_ascii=False)[:400] if raw_usage else "{}",
     )
+    return Response(
+        status_code=200,
+        media_type="application/json",
+        content=json.dumps(translated),
+    )
+
+
+@router.post("/v1/messages")
+async def messages(request: Request):
+    """Anthropic Messages API -> Mistral Conversations create.
+
+    Stateless (always creates a new conversation from the full ``messages``
+    window), mirroring how ``/v1/chat/completions`` works.  Auth accepts
+    both ``x-api-key`` (Anthropic) and ``Authorization: Bearer`` (OpenAI).
+    """
+    try:
+        body = await request.json()
+    except Exception:
+        return error_response(400, "Invalid JSON body", "bad_request")
+
+    model = resolve_model(body.get("model"))
+    try:
+        payload = anthropic_to_mistral(body)
+    except Exception as e:
+        return error_response(422, f"Payload translation error: {e}", "invalid_payload")
+
+    upstream_key = resolve_key(request)
+    if not upstream_key:
+        return error_response(401, "Missing API key (x-api-key or Authorization or MISTRAL_KEY)", "missing_api_key")
+
+    raw_msgs = body.get("messages") if isinstance(body.get("messages"), list) else []
+    raw_roles = []
+    user_preview = []
+    for message_entry in raw_msgs:
+        if not isinstance(message_entry, dict):
+            continue
+        role = message_entry.get("role") or "?"
+        raw_roles.append(role)
+        if role == "user":
+            txt = content_to_text(message_entry.get("content")).replace("\n", " ")
+            user_preview.append(txt[:80] + ("…" if len(txt) > 80 else ""))
+    log.info(
+        "messages → %s raw=%s users=%s inputs=%s tools=%d reason=%s max_tokens=%s store=%s",
+        model,
+        raw_roles,
+        user_preview,
+        input_kinds(payload.get("inputs")),
+        len(payload.get("tools") or []),
+        payload.get("completion_args", {}).get("reasoning_effort"),
+        payload.get("completion_args", {}).get("max_tokens"),
+        payload.get("store"),
+    )
+
+    if body.get("stream"):
+        payload["stream"] = True
+
+        session = aiohttp.ClientSession()
+        try:
+            resp = await session.post(
+                MISTRAL_BASE,
+                headers=_auth_headers(upstream_key),
+                json=payload,
+                timeout=UPSTREAM_TIMEOUT,
+            )
+        except (aiohttp.ClientError, asyncio.TimeoutError) as e:
+            log.error("connection error: %s", e)
+            await session.close()
+            return error_response(502, str(e), "upstream_unreachable")
+        if resp.status != 200:
+            text = await resp.text()
+            log.warning("upstream %s: %s", resp.status, text[:200])
+            resp.release()
+            await session.close()
+            return error_response(
+                resp.status if resp.status < 500 else 502, text[:500]
+            )
+
+        return StreamingResponse(
+            stream_anthropic(session, resp, model),
+            media_type="text/event-stream",
+            headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+        )
+
+    async with aiohttp.ClientSession() as session:
+        try:
+            async with session.post(
+                MISTRAL_BASE,
+                headers=_auth_headers(upstream_key),
+                json=payload,
+                timeout=UPSTREAM_TIMEOUT,
+            ) as resp:
+                text = await resp.text()
+                if resp.status != 200:
+                    log.warning("upstream %s: %s", resp.status, text[:200])
+                    return error_response(
+                        resp.status if resp.status < 500 else 502,
+                        text[:500],
+                    )
+                data = json.loads(text)
+        except (aiohttp.ClientError, asyncio.TimeoutError) as e:
+            log.error("connection error: %s", e)
+            return error_response(502, str(e), "upstream_unreachable")
+        except json.JSONDecodeError:
+            log.error("bad upstream JSON")
+            return error_response(502, "Bad upstream response")
+
+    translated = mistral_to_anthropic(data, model)
     return Response(
         status_code=200,
         media_type="application/json",
