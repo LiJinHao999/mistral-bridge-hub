@@ -1504,7 +1504,9 @@ async def post_conversation(session, key: str, payload: dict, conv_id: str = Non
                 )
                 if resp.status == 200:
                     if reason == "create" and conv_id:
-                        log.info("append %s missing → create", conv_id)
+                        # Why append gave up was already logged at that point;
+                        # do not relabel every fallback as a missing conversation.
+                        log.info("append %s → create", conv_id)
                     return resp, reason, ""
                 last_text = await resp.text()
                 log.warning("upstream %s %s: %s", reason, resp.status, last_text[:200])
@@ -1547,166 +1549,150 @@ async def post_conversation(session, key: str, payload: dict, conv_id: str = Non
 
 
 # ── Streaming ─────────────────────────────────────────────────────────────────
-async def stream_response(upstream_key: str, model: str, payload: dict):
-    """SSE proxy: Mistral conversations stream -> OpenAI chat.completion.chunk."""
+async def stream_response(session, resp, model: str):
+    """SSE proxy: Mistral conversations stream -> OpenAI chat.completion.chunk.
+
+    `resp` is already open and answered 200 — the caller keeps the upstream
+    request outside this generator so it can still return the real HTTP status.
+    Starlette sends the status line before iterating a StreamingResponse, so an
+    upstream 402/429 reported from in here would reach AxonHub as a 200 and its
+    key pool would never rotate off the exhausted key.
+    """
     chunk_id = f"chatcmpl-{int(time.time())}"
     conv_id = None
-    last_err = None
-    async with aiohttp.ClientSession() as session:
-      for attempt in range(1, CREATE_CONNECT_RETRIES + 1):
-        opened = False
-        try:
-            async with session.post(
-                MISTRAL_BASE,
-                headers=_auth_headers(upstream_key),
-                json=payload,
-                timeout=UPSTREAM_TIMEOUT,
-            ) as resp:
-                if resp.status != 200:
-                    text = await resp.text()
-                    log.warning("upstream %s: %s", resp.status, text[:200])
-                    yield f"data: {json.dumps({'error': {'message': text[:500], 'type': 'upstream_error'}})}\n\n"
-                    yield "data: [DONE]\n\n"
-                    return
+    try:
+        saw_tool_call = False
+        sent_role = False
+        yielded = 0
+        seen_types = []
+        tool_names = []
+        tool_state = {}
+        text_acc = ""
+        think_acc = ""
+        raw_usage = {}
 
-                opened = True
-                saw_tool_call = False
-                sent_role = False
-                yielded = 0
-                seen_types = []
-                tool_names = []
-                tool_state = {}
-                text_acc = ""
-                think_acc = ""
-                raw_usage = {}
+        def emit(delta: dict):
+            nonlocal yielded, sent_role
+            if not sent_role:
+                delta = dict(delta)
+                delta["role"] = "assistant"
+                if "tool_calls" in delta and "content" not in delta:
+                    delta["content"] = None
+                sent_role = True
+            yielded += 1
+            return f"data: {json.dumps(_openai_chunk(model, delta, chunk_id=chunk_id))}\n\n"
 
-                def emit(delta: dict):
-                    nonlocal yielded, sent_role
-                    if not sent_role:
-                        delta = dict(delta)
-                        delta["role"] = "assistant"
-                        if "tool_calls" in delta and "content" not in delta:
-                            delta["content"] = None
-                        sent_role = True
-                    yielded += 1
-                    return f"data: {json.dumps(_openai_chunk(model, delta, chunk_id=chunk_id))}\n\n"
+        async for etype, data in iter_conversation_events(resp):
+            if etype and len(seen_types) < 8:
+                seen_types.append(etype)
+            if etype in ("done",):
+                break
+            if etype == "conversation.response.started":
+                conv_id = data.get("conversation_id") or conv_id
+                raw_usage = usage_from_event(data) or raw_usage
+                continue
+            if etype == "conversation.response.error":
+                msg = data.get("message") or "upstream stream error"
+                log.warning("stream error: %s", msg)
+                yield f"data: {json.dumps({'error': {'message': msg, 'type': 'upstream_error'}})}\n\n"
+                yield "data: [DONE]\n\n"
+                return
+            if etype == "conversation.response.done":
+                conv_id = data.get("conversation_id") or conv_id
+                raw_usage = usage_from_event(data) or raw_usage
+                break
 
-                async for etype, data in iter_conversation_events(resp):
-                    if etype and len(seen_types) < 8:
-                        seen_types.append(etype)
-                    if etype in ("done",):
-                        break
-                    if etype == "conversation.response.started":
-                        conv_id = data.get("conversation_id") or conv_id
-                        raw_usage = usage_from_event(data) or raw_usage
-                        continue
-                    if etype == "conversation.response.error":
-                        msg = data.get("message") or "upstream stream error"
-                        log.warning("stream error: %s", msg)
-                        yield f"data: {json.dumps({'error': {'message': msg, 'type': 'upstream_error'}})}\n\n"
-                        yield "data: [DONE]\n\n"
-                        return
-                    if etype == "conversation.response.done":
-                        conv_id = data.get("conversation_id") or conv_id
-                        raw_usage = usage_from_event(data) or raw_usage
-                        break
+            if etype == "message.output.delta":
+                delta = _delta_from_message_content(data.get("content"))
+                if not delta:
+                    continue
+                if delta.get("content"):
+                    text_acc += delta["content"]
+                if delta.get("reasoning_content"):
+                    think_acc += delta["reasoning_content"]
+                yield emit(delta)
+            elif etype == "function.call.delta":
+                tcid = data.get("tool_call_id") or data.get("id") or ""
+                name = data.get("name") or ""
+                incoming = data.get("arguments")
+                if incoming is None:
+                    incoming = ""
+                elif not isinstance(incoming, str):
+                    incoming = _as_json_string(incoming)
+                if tcid not in tool_state:
+                    tool_state[tcid] = {"index": len(tool_state), "args": ""}
+                state = tool_state[tcid]
+                frag = _args_fragment(state["args"], incoming)
+                state["args"] += frag
+                if name:
+                    state["name"] = name
 
-                    if etype == "message.output.delta":
-                        delta = _delta_from_message_content(data.get("content"))
-                        if not delta:
-                            continue
-                        if delta.get("content"):
-                            text_acc += delta["content"]
-                        if delta.get("reasoning_content"):
-                            think_acc += delta["reasoning_content"]
-                        yield emit(delta)
-                    elif etype == "function.call.delta":
-                        tcid = data.get("tool_call_id") or data.get("id") or ""
-                        name = data.get("name") or ""
-                        incoming = data.get("arguments")
-                        if incoming is None:
-                            incoming = ""
-                        elif not isinstance(incoming, str):
-                            incoming = _as_json_string(incoming)
-                        if tcid not in tool_state:
-                            tool_state[tcid] = {"index": len(tool_state), "args": ""}
-                        state = tool_state[tcid]
-                        frag = _args_fragment(state["args"], incoming)
-                        state["args"] += frag
-                        if name:
-                            state["name"] = name
-
-                ordered = sorted(tool_state.items(), key=lambda kv: kv[1]["index"])
-                dropped = []
-                for tcid, state in ordered:
-                    name = state.get("name") or ""
-                    args = state.get("args") or "{}"
-                    if not name:
-                        continue
-                    # A token limit truncates arguments without any error event.
-                    # Handing the client half-written JSON is worse than dropping
-                    # the call: a cut heredoc or patch gets executed as-is.
-                    if not _json_args_complete(args):
-                        log.warning(
-                            "drop truncated tool call id=%s name=%s len=%d",
-                            tcid, name, len(args),
-                        )
-                        dropped.append(name)
-                        continue
-                    saw_tool_call = True
-                    tool_names.append(name)
-                    preview = args if len(args) < 200 else args[:200] + "…"
-                    log.info("tool call id=%s name=%s args=%s", tcid, name, preview)
-                    yield emit({
-                        "tool_calls": [{
-                            "index": state["index"],
-                            "id": tcid,
-                            "type": "function",
-                            "function": {"name": name, "arguments": args},
-                        }]
-                    })
-
-                if dropped:
-                    # Keep the turn non-empty and tell the model why, so the
-                    # caller's loop can correct instead of replaying the turn.
-                    note = (
-                        "[bridge] Dropped truncated tool call(s): %s. The arguments were "
-                        "cut off by the upstream token limit, so the call was never valid "
-                        "JSON. Retry in smaller chunks." % ", ".join(dropped)
-                    )
-                    yield emit({"content": ("\n\n" + note) if text_acc else note})
-
-                if not sent_role:
-                    yield emit({"content": ""})
-                finish_reason = "tool_calls" if saw_tool_call else "stop"
-                fields = mistral_usage_fields(raw_usage, conv_id)
-                usage = chat_usage_from_fields(fields)
-                log.info(
-                    "stream done conv=%s types=%s chunks=%d finish=%s tools=%s usage=%s think=%d raw_usage_keys=%s",
-                    conv_id, seen_types, yielded, finish_reason, tool_names,
-                    f"{usage['prompt_tokens']}+{usage['completion_tokens']}={usage['total_tokens']}"
-                    f" {cache_log_label(fields)}",
-                    len(think_acc),
-                    sorted((raw_usage or {}).keys()),
+        ordered = sorted(tool_state.items(), key=lambda kv: kv[1]["index"])
+        dropped = []
+        for tcid, state in ordered:
+            name = state.get("name") or ""
+            args = state.get("args") or "{}"
+            if not name:
+                continue
+            # A token limit truncates arguments without any error event.
+            # Handing the client half-written JSON is worse than dropping
+            # the call: a cut heredoc or patch gets executed as-is.
+            if not _json_args_complete(args):
+                log.warning(
+                    "drop truncated tool call id=%s name=%s len=%d",
+                    tcid, name, len(args),
                 )
-                yield f"data: {json.dumps(_openai_chunk(model, {}, finish_reason, chunk_id, usage))}\n\n"
-                yield "data: [DONE]\n\n"
-                return
-        except aiohttp.ClientError as e:
-            last_err = e
-            log.error("connection error: %s (attempt=%d/%d opened=%s)", e, attempt, CREATE_CONNECT_RETRIES, opened)
-            if opened or not is_transient_upstream(e) or attempt >= CREATE_CONNECT_RETRIES:
-                yield f"data: {json.dumps({'error': {'message': str(e), 'type': 'upstream_unreachable'}})}\n\n"
-                yield "data: [DONE]\n\n"
-                return
-            log.warning("retry create after disconnect in %ss", CREATE_RETRY_BACKOFF * attempt)
-            await asyncio.sleep(CREATE_RETRY_BACKOFF * attempt)
-      if last_err is not None:
-          yield f"data: {json.dumps({'error': {'message': str(last_err), 'type': 'upstream_unreachable'}})}\n\n"
-          yield "data: [DONE]\n\n"
+                dropped.append(name)
+                continue
+            saw_tool_call = True
+            tool_names.append(name)
+            preview = args if len(args) < 200 else args[:200] + "…"
+            log.info("tool call id=%s name=%s args=%s", tcid, name, preview)
+            yield emit({
+                "tool_calls": [{
+                    "index": state["index"],
+                    "id": tcid,
+                    "type": "function",
+                    "function": {"name": name, "arguments": args},
+                }]
+            })
+
+        if dropped:
+            # Keep the turn non-empty and tell the model why, so the
+            # caller's loop can correct instead of replaying the turn.
+            note = (
+                "[bridge] Dropped truncated tool call(s): %s. The arguments were "
+                "cut off by the upstream token limit, so the call was never valid "
+                "JSON. Retry in smaller chunks." % ", ".join(dropped)
+            )
+            yield emit({"content": ("\n\n" + note) if text_acc else note})
+
+        if not sent_role:
+            yield emit({"content": ""})
+        finish_reason = "tool_calls" if saw_tool_call else "stop"
+        fields = mistral_usage_fields(raw_usage, conv_id)
+        usage = chat_usage_from_fields(fields)
+        log.info(
+            "stream done conv=%s types=%s chunks=%d finish=%s tools=%s usage=%s think=%d raw_usage_keys=%s",
+            conv_id, seen_types, yielded, finish_reason, tool_names,
+            f"{usage['prompt_tokens']}+{usage['completion_tokens']}={usage['total_tokens']}"
+            f" {cache_log_label(fields)}",
+            len(think_acc),
+            sorted((raw_usage or {}).keys()),
+        )
+        yield f"data: {json.dumps(_openai_chunk(model, {}, finish_reason, chunk_id, usage))}\n\n"
+        yield "data: [DONE]\n\n"
+        return
+    except aiohttp.ClientError as e:
+        log.error("connection error mid-stream: %s", e)
+        yield f"data: {json.dumps({'error': {'message': str(e), 'type': 'upstream_unreachable'}})}\n\n"
+        yield "data: [DONE]\n\n"
+    finally:
+        resp.release()
+        await session.close()
 
 
-async def stream_responses(upstream_key: str, model: str, payload: dict, conv_id: str = None, entries: list = None, append_payload: dict = None):
+async def stream_responses(session, resp, reason, opener, model: str, conv_id: str = None, entries: list = None):
     """SSE proxy: Mistral conversations stream -> OpenAI Responses events.
 
     Clients treat a stream without output_text.done / function_call_arguments.done
@@ -1714,10 +1700,15 @@ async def stream_responses(upstream_key: str, model: str, payload: dict, conv_id
     here ends in response.completed or response.failed. A turn that already
     streamed content and then lost the socket is completed with what arrived —
     failing it mid-agent is what breaks the caller's loop.
+
+    `resp` is already open and answered 200. The caller runs the upstream
+    request itself so it can still choose the HTTP status: Starlette sends the
+    status line before it iterates this generator, so a 402/429 discovered in
+    here could only ever be a 200 carrying response.failed — which AxonHub
+    reads as a successful turn and never rotates the exhausted key on.
     """
     terminal = False
     last_err = None
-    reason = "create"
 
     # Stream state. created_sent / seq span attempts: a retry that has not
     # emitted anything yet continues the same logical stream, it does not
@@ -2022,240 +2013,207 @@ async def stream_responses(upstream_key: str, model: str, payload: dict, conv_id
             "response": response_obj("completed", items, usage),
         })
 
+    reopened = False
     try:
-        async with aiohttp.ClientSession() as session:
-            for url, body, attempt_reason in conversation_attempts(payload, conv_id, append_payload):
-                reason = attempt_reason
-                tries = CREATE_CONNECT_RETRIES if reason == "create" else APPEND_CONFLICT_RETRIES
-                for attempt in range(1, tries + 1):
-                    opened = False
-                    got_event = False
-                    reset_turn()
-                    # Never advertise a client-local id on a create fallback.
-                    rid = conv_id if reason == "append" else ""
-                    try:
-                        async with session.post(
-                            url,
-                            headers=_auth_headers(upstream_key),
-                            json=body,
-                            timeout=UPSTREAM_TIMEOUT,
-                        ) as resp:
-                            if resp.status != 200:
-                                last_text = await resp.text()
-                                log.warning("upstream %s %s: %s", reason, resp.status, last_text[:200])
-                                if reason == "append" and concurrent_conversation(resp.status, last_text):
-                                    if attempt < tries:
-                                        log.info(
-                                            "append %s concurrent, retry in %ss",
-                                            conv_id, append_backoff(attempt),
-                                        )
-                                        await asyncio.sleep(append_backoff(attempt))
-                                        continue
-                                    # Another turn owns this conversation. Creating
-                                    # costs a cache miss; failing costs the agent.
-                                    log.info("append %s still busy after %d tries → create", conv_id, tries)
-                                    evict_conversation(conv_id)
-                                    break
-                                if reason == "append" and append_should_fallback(resp.status, last_text):
-                                    if upstream_history_corrupt(resp.status, last_text):
-                                        evict_conversation(conv_id)
-                                        log.warning("append %s history corrupt → create", conv_id)
-                                    elif append_state_mismatch(resp.status, last_text):
-                                        evict_conversation(conv_id)
-                                        log.info("append %s state mismatch → create", conv_id)
-                                    else:
-                                        log.info("append %s missing → create", conv_id)
-                                    break
-                                terminal = True
-                                yield failed(last_text[:500])
-                                return
-
-                            opened = True
-                            log.info("responses stream %s", reason)
-
-                            async for etype, data in iter_conversation_events(resp):
-                                got_event = True
-                                if etype and len(seen_types) < 8:
-                                    seen_types.append(etype)
-                                if etype == "conversation.response.started":
-                                    rid = data.get("conversation_id") or rid
-                                    raw_usage = merge_raw_usage(raw_usage, usage_from_event(data))
-                                    for ev in ensure_created():
-                                        yield ev
-                                    continue
-                                if etype == "conversation.response.error":
-                                    msg = data.get("message") or "upstream stream error"
-                                    log.warning("stream error: %s", msg)
-                                    if emitted_output():
-                                        for ev in finalize(partial=True):
-                                            yield ev
-                                        return
-                                    terminal = True
-                                    yield failed(msg, rid)
-                                    return
-                                if etype in ("conversation.response.done", "done"):
-                                    rid = (data or {}).get("conversation_id") or rid
-                                    raw_usage = merge_raw_usage(raw_usage, usage_from_event(data))
-                                    break
-
-                                for ev in ensure_created():
-                                    yield ev
-
-                                if etype == "message.output.delta":
-                                    delta = _delta_from_message_content(data.get("content"))
-                                    if not delta:
-                                        continue
-                                    thought = delta.get("reasoning_content") or ""
-                                    if thought:
-                                        reason_acc += thought
-                                        if not reason_started:
-                                            reason_started = True
-                                            reason_index = take_index()
-                                            item = {
-                                                "type": "reasoning",
-                                                "id": reason_item_id,
-                                                "summary": [{"type": "summary_text", "text": ""}],
-                                            }
-                                            yield _responses_event("response.output_item.added", {
-                                                "type": "response.output_item.added",
-                                                "output_index": reason_index,
-                                                "item": item,
-                                                "sequence_number": next_seq(),
-                                            })
-                                            yield _responses_event("response.reasoning_summary_part.added", {
-                                                "type": "response.reasoning_summary_part.added",
-                                                "item_id": reason_item_id,
-                                                "output_index": reason_index,
-                                                "summary_index": 0,
-                                                "part": {"type": "summary_text", "text": ""},
-                                                "sequence_number": next_seq(),
-                                            })
-                                        yield _responses_event("response.reasoning_summary_text.delta", {
-                                            "type": "response.reasoning_summary_text.delta",
-                                            "item_id": reason_item_id,
-                                            "output_index": reason_index,
-                                            "summary_index": 0,
-                                            "delta": thought,
-                                            "sequence_number": next_seq(),
-                                        })
-                                    text = delta.get("content") or ""
-                                    if not text:
-                                        continue
-                                    text_acc += text
-                                    if not text_started:
-                                        text_started = True
-                                        text_index = take_index()
-                                        item = {
-                                            "type": "message",
-                                            "id": text_item_id,
-                                            "role": "assistant",
-                                            "status": "in_progress",
-                                            "content": [{"type": "output_text", "text": ""}],
-                                        }
-                                        yield _responses_event("response.output_item.added", {
-                                            "type": "response.output_item.added",
-                                            "output_index": text_index,
-                                            "item": item,
-                                            "sequence_number": next_seq(),
-                                        })
-                                        yield _responses_event("response.content_part.added", {
-                                            "type": "response.content_part.added",
-                                            "item_id": text_item_id,
-                                            "output_index": text_index,
-                                            "content_index": 0,
-                                            "part": {"type": "output_text", "text": ""},
-                                            "sequence_number": next_seq(),
-                                        })
-                                    yield _responses_event("response.output_text.delta", {
-                                        "type": "response.output_text.delta",
-                                        "item_id": text_item_id,
-                                        "output_index": text_index,
-                                        "content_index": 0,
-                                        "delta": text,
-                                        "sequence_number": next_seq(),
-                                    })
-                                elif etype == "function.call.delta":
-                                    tcid = data.get("tool_call_id") or data.get("id") or ""
-                                    name = data.get("name") or ""
-                                    incoming = data.get("arguments")
-                                    if incoming is None:
-                                        incoming = ""
-                                    elif not isinstance(incoming, str):
-                                        incoming = _as_json_string(incoming)
-                                    if tcid not in tool_state:
-                                        tool_state[tcid] = {
-                                            "index": len(tool_state),
-                                            "args": "",
-                                            "item_id": tcid or f"fc_{len(tool_state)}",
-                                            "announced": False,
-                                            "output_index": None,
-                                        }
-                                    state = tool_state[tcid]
-                                    frag = _args_fragment(state["args"], incoming)
-                                    state["args"] += frag
-                                    if name:
-                                        state["name"] = name
-                                    if not state["announced"] and state.get("name"):
-                                        state["announced"] = True
-                                        state["output_index"] = take_index()
-                                        yield _responses_event("response.output_item.added", {
-                                            "type": "response.output_item.added",
-                                            "output_index": state["output_index"],
-                                            "item": {
-                                                "type": "function_call",
-                                                "id": state["item_id"],
-                                                "call_id": tcid,
-                                                "name": state["name"],
-                                                "arguments": "",
-                                            },
-                                            "sequence_number": next_seq(),
-                                        })
-                                    if frag and state.get("output_index") is not None:
-                                        yield _responses_event("response.function_call_arguments.delta", {
-                                            "type": "response.function_call_arguments.delta",
-                                            "item_id": state["item_id"],
-                                            "output_index": state["output_index"],
-                                            "delta": frag,
-                                            "sequence_number": next_seq(),
-                                        })
-
-                            for ev in finalize():
-                                yield ev
-                            return
-                    except aiohttp.ClientError as e:
-                        last_err = e
-                        log.error(
-                            "connection error: %s (reason=%s attempt=%d/%d opened=%s got_event=%s emitted=%s)",
-                            e, reason, attempt, tries, opened, got_event, emitted_output(),
-                        )
+        while True:
+            got_event = False
+            reset_turn()
+            # Never advertise a client-local id on a create fallback.
+            rid = conv_id if reason == "append" else ""
+            try:
+                log.info("responses stream %s", reason)
+                async for etype, data in iter_conversation_events(resp):
+                    got_event = True
+                    if etype and len(seen_types) < 8:
+                        seen_types.append(etype)
+                    if etype == "conversation.response.started":
+                        rid = data.get("conversation_id") or rid
+                        raw_usage = merge_raw_usage(raw_usage, usage_from_event(data))
+                        for ev in ensure_created():
+                            yield ev
+                        continue
+                    if etype == "conversation.response.error":
+                        msg = data.get("message") or "upstream stream error"
+                        log.warning("stream error: %s", msg)
                         if emitted_output():
-                            # Tokens are already on the wire; a retry would
-                            # duplicate them. Close the turn with what arrived.
-                            log.warning("upstream cut mid-stream → completing partial turn")
                             for ev in finalize(partial=True):
                                 yield ev
                             return
-                        if is_transient_upstream(e) and attempt < tries:
-                            log.warning(
-                                "retry %s after disconnect in %ss",
-                                reason, CREATE_RETRY_BACKOFF * attempt,
-                            )
-                            await asyncio.sleep(CREATE_RETRY_BACKOFF * attempt)
-                            continue
-                        if reason == "append":
-                            # Nothing reached the client, so create can still
-                            # serve this turn instead of failing it.
-                            log.info("append %s unreachable → create", conv_id)
-                            break
                         terminal = True
-                        yield failed(str(e))
+                        yield failed(msg, rid)
                         return
+                    if etype in ("conversation.response.done", "done"):
+                        rid = (data or {}).get("conversation_id") or rid
+                        raw_usage = merge_raw_usage(raw_usage, usage_from_event(data))
+                        break
+
+                    for ev in ensure_created():
+                        yield ev
+
+                    if etype == "message.output.delta":
+                        delta = _delta_from_message_content(data.get("content"))
+                        if not delta:
+                            continue
+                        thought = delta.get("reasoning_content") or ""
+                        if thought:
+                            reason_acc += thought
+                            if not reason_started:
+                                reason_started = True
+                                reason_index = take_index()
+                                item = {
+                                    "type": "reasoning",
+                                    "id": reason_item_id,
+                                    "summary": [{"type": "summary_text", "text": ""}],
+                                }
+                                yield _responses_event("response.output_item.added", {
+                                    "type": "response.output_item.added",
+                                    "output_index": reason_index,
+                                    "item": item,
+                                    "sequence_number": next_seq(),
+                                })
+                                yield _responses_event("response.reasoning_summary_part.added", {
+                                    "type": "response.reasoning_summary_part.added",
+                                    "item_id": reason_item_id,
+                                    "output_index": reason_index,
+                                    "summary_index": 0,
+                                    "part": {"type": "summary_text", "text": ""},
+                                    "sequence_number": next_seq(),
+                                })
+                            yield _responses_event("response.reasoning_summary_text.delta", {
+                                "type": "response.reasoning_summary_text.delta",
+                                "item_id": reason_item_id,
+                                "output_index": reason_index,
+                                "summary_index": 0,
+                                "delta": thought,
+                                "sequence_number": next_seq(),
+                            })
+                        text = delta.get("content") or ""
+                        if not text:
+                            continue
+                        text_acc += text
+                        if not text_started:
+                            text_started = True
+                            text_index = take_index()
+                            item = {
+                                "type": "message",
+                                "id": text_item_id,
+                                "role": "assistant",
+                                "status": "in_progress",
+                                "content": [{"type": "output_text", "text": ""}],
+                            }
+                            yield _responses_event("response.output_item.added", {
+                                "type": "response.output_item.added",
+                                "output_index": text_index,
+                                "item": item,
+                                "sequence_number": next_seq(),
+                            })
+                            yield _responses_event("response.content_part.added", {
+                                "type": "response.content_part.added",
+                                "item_id": text_item_id,
+                                "output_index": text_index,
+                                "content_index": 0,
+                                "part": {"type": "output_text", "text": ""},
+                                "sequence_number": next_seq(),
+                            })
+                        yield _responses_event("response.output_text.delta", {
+                            "type": "response.output_text.delta",
+                            "item_id": text_item_id,
+                            "output_index": text_index,
+                            "content_index": 0,
+                            "delta": text,
+                            "sequence_number": next_seq(),
+                        })
+                    elif etype == "function.call.delta":
+                        tcid = data.get("tool_call_id") or data.get("id") or ""
+                        name = data.get("name") or ""
+                        incoming = data.get("arguments")
+                        if incoming is None:
+                            incoming = ""
+                        elif not isinstance(incoming, str):
+                            incoming = _as_json_string(incoming)
+                        if tcid not in tool_state:
+                            tool_state[tcid] = {
+                                "index": len(tool_state),
+                                "args": "",
+                                "item_id": tcid or f"fc_{len(tool_state)}",
+                                "announced": False,
+                                "output_index": None,
+                            }
+                        state = tool_state[tcid]
+                        frag = _args_fragment(state["args"], incoming)
+                        state["args"] += frag
+                        if name:
+                            state["name"] = name
+                        if not state["announced"] and state.get("name"):
+                            state["announced"] = True
+                            state["output_index"] = take_index()
+                            yield _responses_event("response.output_item.added", {
+                                "type": "response.output_item.added",
+                                "output_index": state["output_index"],
+                                "item": {
+                                    "type": "function_call",
+                                    "id": state["item_id"],
+                                    "call_id": tcid,
+                                    "name": state["name"],
+                                    "arguments": "",
+                                },
+                                "sequence_number": next_seq(),
+                            })
+                        if frag and state.get("output_index") is not None:
+                            yield _responses_event("response.function_call_arguments.delta", {
+                                "type": "response.function_call_arguments.delta",
+                                "item_id": state["item_id"],
+                                "output_index": state["output_index"],
+                                "delta": frag,
+                                "sequence_number": next_seq(),
+                            })
+
+                for ev in finalize():
+                    yield ev
+                return
+            except aiohttp.ClientError as e:
+                last_err = e
+                log.error(
+                    "connection error: %s (reason=%s got_event=%s emitted=%s reopened=%s)",
+                    e, reason, got_event, emitted_output(), reopened,
+                )
+                if emitted_output():
+                    # Tokens are already on the wire; a retry would duplicate
+                    # them. Close the turn with what arrived.
+                    log.warning("upstream cut mid-stream → completing partial turn")
+                    for ev in finalize(partial=True):
+                        yield ev
+                    return
+                # Nothing reached the client yet, so the turn can still be
+                # served by reopening once. The status line is already 200 by
+                # now, so a second failure can only be reported in-band.
+                if reopened:
+                    break
+                reopened = True
+                resp.release()
+                try:
+                    resp, reason, err_text = await opener()
+                except aiohttp.ClientError as e2:
+                    last_err = e2
+                    resp = None
+                    break
+                if resp is None or resp.status != 200:
+                    if resp is not None:
+                        last_err = Exception(err_text[:200] or f"upstream {resp.status}")
+                        resp.release()
+                        resp = None
+                    break
+                log.warning("stream reopened after disconnect (%s)", reason)
+                continue
         if not terminal:
             terminal = True
             yield failed(
                 str(last_err) if last_err else "upstream stream ended without a terminal event"
             )
     finally:
+        if resp is not None:
+            resp.release()
+        await session.close()
         if conv_id:
             mark_conversation_busy(conv_id, False)
 
@@ -2314,8 +2272,33 @@ async def chat(request: Request):
 
     if body.get("stream"):
         payload["stream"] = True
+
+        # Same reason as /v1/responses: the status line is committed before the
+        # generator runs, so the upstream request has to happen out here for a
+        # 402/429 to reach AxonHub as a real status instead of a 200.
+        session = aiohttp.ClientSession()
+        try:
+            resp = await session.post(
+                MISTRAL_BASE,
+                headers=_auth_headers(upstream_key),
+                json=payload,
+                timeout=UPSTREAM_TIMEOUT,
+            )
+        except aiohttp.ClientError as e:
+            log.error("connection error: %s", e)
+            await session.close()
+            return error_response(502, str(e), "upstream_unreachable")
+        if resp.status != 200:
+            text = await resp.text()
+            log.warning("upstream %s: %s", resp.status, text[:200])
+            resp.release()
+            await session.close()
+            return error_response(
+                resp.status if resp.status < 500 else 502, text[:500]
+            )
+
         return StreamingResponse(
-            stream_response(upstream_key, model, payload),
+            stream_response(session, resp, model),
             media_type="text/event-stream",
             headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
         )
@@ -2430,8 +2413,34 @@ async def responses(request: Request):
         payload["stream"] = True
         if append_payload:
             append_payload["stream"] = True
+
+        # Run the upstream request here, not inside the generator: Starlette
+        # sends the status line before it iterates a StreamingResponse, so an
+        # upstream 402/429 discovered in there can only be a 200 carrying
+        # response.failed. AxonHub holds the key pool and rotates on the HTTP
+        # status, so swallowing 402 pins it to an exhausted key forever.
+        session = aiohttp.ClientSession()
+        opener = lambda: post_conversation(  # noqa: E731 - reopen after a mid-stream cut
+            session, upstream_key, payload, prev, append_payload
+        )
+        try:
+            resp, reason, err_text = await opener()
+        except aiohttp.ClientError as e:
+            log.error("connection error: %s", e)
+            await session.close()
+            mark_conversation_busy(prev, False)
+            return error_response(502, str(e), "upstream_unreachable")
+        if resp is None or resp.status != 200:
+            status = resp.status if resp is not None else 502
+            text = err_text or (await resp.text() if resp is not None else "upstream unreachable")
+            if resp is not None:
+                resp.release()
+            await session.close()
+            mark_conversation_busy(prev, False)
+            return error_response(status if status < 500 else 502, text[:500])
+
         return StreamingResponse(
-            stream_responses(upstream_key, model, payload, prev, entries, append_payload),
+            stream_responses(session, resp, reason, opener, model, prev, entries),
             media_type="text/event-stream",
             headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
         )
