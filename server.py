@@ -1864,6 +1864,33 @@ async def stream_responses(session, resp, reason, opener, model: str, conv_id: s
             ):
                 yield ev
 
+        # A reasoning item is not visible output: a turn carrying nothing else
+        # reaches the client as an empty response and it reports "no visible
+        # output". Say so instead, and do not promote the thinking to text —
+        # that text would be stored on the conversation and replayed on every
+        # later append, so a long ramble would cost tokens for the rest of the
+        # thread and invite the agent to act on half-formed reasoning.
+        # A cut stream is different and is failed below, where retrying helps.
+        surviving_tools = [
+            state for _, state in tool_state.items()
+            if state.get("name") and _json_args_complete(state.get("args") or "{}")
+        ]
+        if (
+            not partial
+            and not text_acc.strip()
+            and not surviving_tools
+            and reason_acc.strip()
+        ):
+            log.warning(
+                "turn produced only reasoning (%d chars) → note instead of empty turn",
+                len(reason_acc),
+            )
+            for ev in emit_text_note(
+                "[bridge] The model produced only reasoning this turn — no reply "
+                "text and no tool call. Ask again to get an actual answer."
+            ):
+                yield ev
+
         indexed = []
         if reason_started:
             reason_item = {
@@ -1996,8 +2023,11 @@ async def stream_responses(session, resp, reason, opener, model: str, conv_id: s
             # Upstream died mid-turn: what it actually stored is unknown, so the
             # next request must not append onto this conversation.
             evict_conversation(rid)
-            if not items:
-                yield failed("upstream stream ended before any output")
+            # Reasoning alone is not something the client can show or act on,
+            # so it must not count as output here: reporting completed made the
+            # caller treat a cut turn as a successful empty one and never retry.
+            if not text_started and not tool_names:
+                yield failed("upstream stream ended before any visible output")
                 return
         elif entries and rid and not truncated:
             # `truncated` was evicted above — caching it back would hand the
