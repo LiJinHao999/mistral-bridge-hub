@@ -9,6 +9,7 @@ Env vars (all optional except a key from the client or MISTRAL_KEY):
 
 import logging
 import os
+from logging.handlers import RotatingFileHandler
 
 import aiohttp
 
@@ -38,5 +39,22 @@ CACHE_BLOCK_TOKENS = 64
 # an already 40–80k-token create prompt.
 THINKING_CREATE_MAX_CHARS = 12000
 
-logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+# nohup used to append stdout forever with no rotation. 83MB in ~90 minutes of
+# agent traffic (every tool call/result is INFO). The file handler rotates
+# in-process; stderr stays for systemd / an attached terminal.
+_LOG_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+LOG_PATH = os.environ.get("BRIDGE_LOG", os.path.join(_LOG_DIR, "bridge.log"))
+_LOG_MAX_BYTES = int(os.environ.get("BRIDGE_LOG_MAX_BYTES", 10 * 1024 * 1024))
+_LOG_BACKUPS = int(os.environ.get("BRIDGE_LOG_BACKUPS", 2))
+_fmt = logging.Formatter("%(asctime)s %(levelname)s %(message)s")
+_handlers = [logging.StreamHandler()]
+try:
+    _file = RotatingFileHandler(
+        LOG_PATH, maxBytes=_LOG_MAX_BYTES, backupCount=_LOG_BACKUPS, encoding="utf-8",
+    )
+    _file.setFormatter(_fmt)
+    _handlers.append(_file)
+except OSError:
+    pass
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s", handlers=_handlers)
 log = logging.getLogger("mistral-bridge")

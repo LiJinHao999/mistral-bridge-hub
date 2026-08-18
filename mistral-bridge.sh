@@ -77,7 +77,9 @@ start_bridge() {
   fi
 
   echo "[bridge] starting with ${PYTHON} on ${BRIDGE_HOST}:${BRIDGE_PORT}"
-  setsid nohup "$PYTHON" -u "${BRIDGE_DIR}/server.py" >> "$LOG_FILE" 2>&1 < /dev/null &
+  # Python RotatingFileHandler owns bridge.log. Do not also nohup-append to it:
+  # a rotate would rename the file while this fd kept writing the old inode.
+  setsid nohup "$PYTHON" -u "${BRIDGE_DIR}/server.py" >> /dev/null 2>&1 < /dev/null &
   echo $! > "$PID_FILE"
 
   local attempt

@@ -5,7 +5,9 @@ __pycache__/
 
 # Logs & runtime
 *.log
+*.log.[0-9]*
 bridge.log
+bridge.log.*
 .env
 
 # Virtual env
