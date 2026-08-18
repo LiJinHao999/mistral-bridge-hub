@@ -32,7 +32,11 @@ PORT         = int(os.environ.get("BRIDGE_PORT", 8577))
 HOST         = os.environ.get("BRIDGE_HOST", "0.0.0.0")
 MISTRAL_API  = "https://api.mistral.ai/v1"
 MISTRAL_BASE = f"{MISTRAL_API}/conversations"
-UPSTREAM_TIMEOUT = aiohttp.ClientTimeout(total=300)
+# Wall-clock `total` is a trap for high-reasoning streams: thinking of ~36k
+# chars was observed cut at ~273s, which is this timeout minus connect.
+# sock_read is the stall detector; each SSE chunk resets it. Connect stays
+# short so an unreachable host fails fast.
+UPSTREAM_TIMEOUT = aiohttp.ClientTimeout(total=None, sock_connect=30, sock_read=180)
 # Mistral sometimes drops the TCP handshake / first bytes on create.
 # Retry locally so AxonHub does not see an empty SSE and replay the turn.
 CREATE_CONNECT_RETRIES = 3
@@ -841,6 +845,8 @@ def is_transient_upstream(err: BaseException) -> bool:
         aiohttp.ServerDisconnectedError,
         aiohttp.ClientPayloadError,
         aiohttp.ClientOSError,
+        asyncio.TimeoutError,
+        TimeoutError,
     )):
         return True
     msg = str(err).lower()
@@ -848,6 +854,7 @@ def is_transient_upstream(err: BaseException) -> bool:
         "disconnected" in msg
         or "cannot connect" in msg
         or "not enough data" in msg
+        or "timeout" in msg
         or "transfer encoding" in msg
     )
 
@@ -1535,7 +1542,7 @@ async def post_conversation(session, key: str, payload: dict, conv_id: str = Non
                         log.info("append %s missing → create", conv_id)
                     break
                 return resp, reason, last_text
-            except aiohttp.ClientError as e:
+            except (aiohttp.ClientError, asyncio.TimeoutError) as e:
                 log.error("connection error: %s (reason=%s attempt=%d/%d)", e, reason, attempt, tries)
                 if is_transient_upstream(e) and attempt < tries:
                     await asyncio.sleep(CREATE_RETRY_BACKOFF * attempt)
@@ -1683,7 +1690,7 @@ async def stream_response(session, resp, model: str):
         yield f"data: {json.dumps(_openai_chunk(model, {}, finish_reason, chunk_id, usage))}\n\n"
         yield "data: [DONE]\n\n"
         return
-    except aiohttp.ClientError as e:
+    except (aiohttp.ClientError, asyncio.TimeoutError) as e:
         log.error("connection error mid-stream: %s", e)
         yield f"data: {json.dumps({'error': {'message': str(e), 'type': 'upstream_unreachable'}})}\n\n"
         yield "data: [DONE]\n\n"
@@ -2020,15 +2027,23 @@ async def stream_responses(session, resp, reason, opener, model: str, conv_id: s
         )
         terminal = True
         if partial:
-            # Upstream died mid-turn: what it actually stored is unknown, so the
-            # next request must not append onto this conversation.
-            evict_conversation(rid)
+            # Truncated tool calls already evicted the thread above. For a
+            # thinking-only or text cut, keep the previous cache record so the
+            # next turn can still append — dropping it is what made every
+            # disconnect throw away the whole prompt-cache chain.
             # Reasoning alone is not something the client can show or act on,
             # so it must not count as output here: reporting completed made the
             # caller treat a cut turn as a successful empty one and never retry.
             if not text_started and not tool_names:
                 yield failed("upstream stream ended before any visible output")
                 return
+            if entries and rid and not truncated:
+                cache_conversation(
+                    rid,
+                    entries,
+                    pending_call_ids_from_tool_state(tool_state),
+                    prompt_tokens=usage.get("input_tokens") or 0,
+                )
         elif entries and rid and not truncated:
             # `truncated` was evicted above — caching it back would hand the
             # next turn the same poisoned conversation.
@@ -2201,7 +2216,7 @@ async def stream_responses(session, resp, reason, opener, model: str, conv_id: s
                 for ev in finalize():
                     yield ev
                 return
-            except aiohttp.ClientError as e:
+            except (aiohttp.ClientError, asyncio.TimeoutError) as e:
                 last_err = e
                 log.error(
                     "connection error: %s (reason=%s got_event=%s emitted=%s reopened=%s)",
@@ -2223,7 +2238,7 @@ async def stream_responses(session, resp, reason, opener, model: str, conv_id: s
                 resp.release()
                 try:
                     resp, reason, err_text = await opener()
-                except aiohttp.ClientError as e2:
+                except (aiohttp.ClientError, asyncio.TimeoutError) as e2:
                     last_err = e2
                     resp = None
                     break
@@ -2314,7 +2329,7 @@ async def chat(request: Request):
                 json=payload,
                 timeout=UPSTREAM_TIMEOUT,
             )
-        except aiohttp.ClientError as e:
+        except (aiohttp.ClientError, asyncio.TimeoutError) as e:
             log.error("connection error: %s", e)
             await session.close()
             return error_response(502, str(e), "upstream_unreachable")
@@ -2349,7 +2364,7 @@ async def chat(request: Request):
                         text[:500],
                     )
                 data = json.loads(text)
-        except aiohttp.ClientError as e:
+        except (aiohttp.ClientError, asyncio.TimeoutError) as e:
             log.error("connection error: %s", e)
             return error_response(502, str(e), "upstream_unreachable")
         except json.JSONDecodeError:
@@ -2455,7 +2470,7 @@ async def responses(request: Request):
         )
         try:
             resp, reason, err_text = await opener()
-        except aiohttp.ClientError as e:
+        except (aiohttp.ClientError, asyncio.TimeoutError) as e:
             log.error("connection error: %s", e)
             await session.close()
             mark_conversation_busy(prev, False)
@@ -2487,7 +2502,7 @@ async def responses(request: Request):
                 data = json.loads(await resp.text())
             finally:
                 resp.release()
-        except aiohttp.ClientError as e:
+        except (aiohttp.ClientError, asyncio.TimeoutError) as e:
             log.error("connection error: %s", e)
             return error_response(502, str(e), "upstream_unreachable")
         except json.JSONDecodeError:
@@ -2535,7 +2550,7 @@ async def proxy_mistral_get(request: Request, path: str, params=None):
                 timeout=aiohttp.ClientTimeout(total=30),
             ) as resp:
                 return resp.status, await resp.text()
-    except aiohttp.ClientError as e:
+    except (aiohttp.ClientError, asyncio.TimeoutError) as e:
         log.warning("upstream GET %s: %s", path, e)
         return None, None
 
