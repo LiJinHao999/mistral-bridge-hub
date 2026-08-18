@@ -6,6 +6,16 @@ import time
 
 import aiohttp
 
+
+class _StreamCut(Exception):
+    """Internal: the upstream SSE ended without a terminal event.
+
+    A quiet EOF (socket closed, no exception, no ``conversation.response.done``)
+    is semantically identical to a connection error mid-stream: the turn was
+    cut.  Raising this lets the single retry/finalize handler in
+    :func:`stream_responses` cover both paths instead of duplicating logic.
+    """
+
 from .cache import (
     cache_conversation,
     evict_conversation,
@@ -752,21 +762,24 @@ async def stream_responses(session, resp, reason, opener, model: str, conv_id: s
                             })
 
                 if not saw_done:
-                    # Quiet EOF after thinking deltas: no exception, no done
-                    # event. Treating that as a clean finish is what made a
-                    # mid-thought disconnect look like an empty successful turn.
+                    # Quiet EOF: no exception, no done event — the upstream
+                    # closed the socket mid-stream.  Raise _StreamCut so the
+                    # shared retry/finalize handler below covers this path
+                    # too.  Without this, a disconnect that returned cleanly
+                    # from readline() would skip the retry entirely and just
+                    # finalize the partial turn.
                     log.warning(
                         "upstream stream ended without conversation.response.done "
                         "(emitted=%s visible=%s think=%d)",
                         emitted_output(), visible_output(), len(reason_acc),
                     )
-                    for ev in finalize(partial=True):
-                        yield ev
-                    return
+                    raise _StreamCut(
+                        "upstream stream ended without conversation.response.done"
+                    )
                 for ev in finalize():
                     yield ev
                 return
-            except (aiohttp.ClientError, asyncio.TimeoutError) as e:
+            except (aiohttp.ClientError, asyncio.TimeoutError, _StreamCut) as e:
                 last_err = e
                 log.error(
                     "connection error: %s (reason=%s got_event=%s emitted=%s visible=%s reopened=%s)",
@@ -1073,10 +1086,7 @@ async def stream_anthropic(session, resp, model: str, conv_id: str = None, entri
         yield sse("message_delta", {
             "type": "message_delta",
             "delta": {"stop_reason": stop_reason, "stop_sequence": None},
-            "usage": {
-                "input_tokens": final_usage["input_tokens"],
-                "output_tokens": final_usage["output_tokens"],
-            },
+            "usage": final_usage,
         })
         yield sse("message_stop", {"type": "message_stop"})
         return

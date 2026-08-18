@@ -152,7 +152,7 @@ def openai_to_mistral(body: dict) -> tuple:
         "model": resolve_model(body.get("model")),
         "inputs": inputs,
         "completion_args": completion_args_from_body(body),
-        "store": store_from_body(body, False),
+        "store": True,
     }
     if instructions:
         payload["instructions"] = instructions
@@ -244,7 +244,7 @@ def anthropic_to_mistral(body: dict) -> tuple:
         "model": resolve_model(body.get("model")),
         "inputs": inputs,
         "completion_args": completion_args_from_body(body),
-        "store": store_from_body(body, False),
+        "store": True,
     }
     if instructions:
         payload["instructions"] = instructions
